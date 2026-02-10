@@ -17,3 +17,7 @@ env.lcoal
 
 # Local run logs
 artifacts/phase0/run.log
+
+# Local external context repos
+.context/
+web/
