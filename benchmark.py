@@ -465,6 +465,14 @@ def parse_args() -> argparse.Namespace:
         default=6.0,
         help="Maximum cached left context in seconds for streaming attention KV cache.",
     )
+    parser.add_argument(
+        "--skip-offline-baseline",
+        action="store_true",
+        help=(
+            "In --streaming mode, skip full-context offline baseline. "
+            "Useful for very long clips where offline inference may OOM."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -489,56 +497,89 @@ def run_streaming_matrix(
     if args.left_context_sec <= 0:
         raise SystemExit(f"--left-context-sec must be > 0, got {args.left_context_sec}")
 
-    print()
-    print("Running offline baseline for streaming comparison...")
     offline_results: list[ClipResult] = []
-    for i, audio_path in enumerate(audio_files):
-        print(f"  [offline {i + 1}/{len(audio_files)}] {audio_path.name}...", end=" ", flush=True)
-        clip = benchmark_clip(
-            audio_path=audio_path,
-            mlx_model=mlx_model,
-            processor=processor,
-            decoder=decoder,
-            hf_model=None,
-            with_references=args.with_references,
-            warmup_done=(i > 0),
-        )
-        offline_results.append(clip)
-        print(f"dur={clip.audio_duration_s:.1f}s mlx_lat={clip.mlx_latency_s:.3f}s rtf={clip.mlx_rtf:.4f}")
+    offline_failure_reason: str | None = None
+    if args.skip_offline_baseline:
+        print()
+        print("Skipping offline baseline (--skip-offline-baseline).")
+    else:
+        print()
+        print("Running offline baseline for streaming comparison...")
+        try:
+            for i, audio_path in enumerate(audio_files):
+                print(f"  [offline {i + 1}/{len(audio_files)}] {audio_path.name}...", end=" ", flush=True)
+                clip = benchmark_clip(
+                    audio_path=audio_path,
+                    mlx_model=mlx_model,
+                    processor=processor,
+                    decoder=decoder,
+                    hf_model=None,
+                    with_references=args.with_references,
+                    warmup_done=(i > 0),
+                )
+                offline_results.append(clip)
+                print(
+                    f"dur={clip.audio_duration_s:.1f}s mlx_lat={clip.mlx_latency_s:.3f}s "
+                    f"rtf={clip.mlx_rtf:.4f}"
+                )
+        except RuntimeError as exc:
+            err = str(exc)
+            if "metal::malloc" in err or "maximum allowed buffer size" in err:
+                offline_failure_reason = err
+                offline_results = []
+                print()
+                print("Offline baseline failed with OOM; continuing with streaming-only scenarios.")
+            else:
+                raise
 
-    offline_lat = np.array([r.mlx_latency_s for r in offline_results], dtype=np.float64)
-    offline_rtf = np.array([r.mlx_rtf for r in offline_results], dtype=np.float64)
-    offline_refs: list[str] = []
-    offline_hyps: list[str] = []
-    if args.with_references:
-        for r in offline_results:
-            ref = load_reference(Path(args.audio_dir) / r.filename)
-            if ref:
-                offline_refs.append(ref)
-                offline_hyps.append(r.mlx_transcript)
-    offline_corpus_wer = jiwer.wer(offline_refs, offline_hyps) if offline_refs else float("nan")
+    if offline_results:
+        offline_lat = np.array([r.mlx_latency_s for r in offline_results], dtype=np.float64)
+        offline_rtf = np.array([r.mlx_rtf for r in offline_results], dtype=np.float64)
+        offline_refs: list[str] = []
+        offline_hyps: list[str] = []
+        if args.with_references:
+            for r in offline_results:
+                ref = load_reference(Path(args.audio_dir) / r.filename)
+                if ref:
+                    offline_refs.append(ref)
+                    offline_hyps.append(r.mlx_transcript)
+        offline_corpus_wer = jiwer.wer(offline_refs, offline_hyps) if offline_refs else float("nan")
 
-    offline_summary: dict[str, Any] = {
-        "num_clips": len(offline_results),
-        "total_audio_duration_s": round(float(sum(r.audio_duration_s for r in offline_results)), 1),
-        "mlx_latency_mean_s": round(float(np.mean(offline_lat)), 4),
-        "mlx_latency_p50_s": round(float(np.percentile(offline_lat, 50)), 4),
-        "mlx_latency_p95_s": round(float(np.percentile(offline_lat, 95)), 4),
-        "mlx_rtf_mean": round(float(np.mean(offline_rtf)), 4),
-        "mlx_rtf_p50": round(float(np.percentile(offline_rtf, 50)), 4),
-        "mlx_rtf_p95": round(float(np.percentile(offline_rtf, 95)), 4),
-        "mlx_corpus_wer": offline_corpus_wer,
-        "clips": [
-            {
-                "filename": r.filename,
-                "audio_duration_s": r.audio_duration_s,
-                "mlx_latency_s": r.mlx_latency_s,
-                "mlx_rtf": r.mlx_rtf,
-                "mlx_wer": r.mlx_wer,
-            }
-            for r in offline_results
-        ],
-    }
+        offline_summary: dict[str, Any] = {
+            "num_clips": len(offline_results),
+            "total_audio_duration_s": round(float(sum(r.audio_duration_s for r in offline_results)), 1),
+            "mlx_latency_mean_s": round(float(np.mean(offline_lat)), 4),
+            "mlx_latency_p50_s": round(float(np.percentile(offline_lat, 50)), 4),
+            "mlx_latency_p95_s": round(float(np.percentile(offline_lat, 95)), 4),
+            "mlx_rtf_mean": round(float(np.mean(offline_rtf)), 4),
+            "mlx_rtf_p50": round(float(np.percentile(offline_rtf, 50)), 4),
+            "mlx_rtf_p95": round(float(np.percentile(offline_rtf, 95)), 4),
+            "mlx_corpus_wer": offline_corpus_wer,
+            "clips": [
+                {
+                    "filename": r.filename,
+                    "audio_duration_s": r.audio_duration_s,
+                    "mlx_latency_s": r.mlx_latency_s,
+                    "mlx_rtf": r.mlx_rtf,
+                    "mlx_wer": r.mlx_wer,
+                }
+                for r in offline_results
+            ],
+        }
+    else:
+        offline_corpus_wer = float("nan")
+        offline_summary = {
+            "num_clips": 0,
+            "total_audio_duration_s": 0.0,
+            "mlx_latency_mean_s": float("nan"),
+            "mlx_latency_p50_s": float("nan"),
+            "mlx_latency_p95_s": float("nan"),
+            "mlx_rtf_mean": float("nan"),
+            "mlx_rtf_p50": float("nan"),
+            "mlx_rtf_p95": float("nan"),
+            "mlx_corpus_wer": float("nan"),
+            "clips": [],
+        }
 
     scenario_summaries: list[dict[str, Any]] = []
     matrix_rows: list[dict[str, Any]] = []
@@ -658,6 +699,16 @@ def run_streaming_matrix(
         writer.writeheader()
         writer.writerows(matrix_rows)
 
+    notes = [
+        "Streaming mode keeps offline path untouched and is enabled only with --streaming.",
+        "MedASR is full-context trained, so chunk boundary WER degradation is expected at smaller chunks.",
+        "Subsampler/front-end state is not yet cached in this v1 implementation.",
+    ]
+    if args.skip_offline_baseline:
+        notes.append("Offline baseline skipped via --skip-offline-baseline.")
+    if offline_failure_reason:
+        notes.append("Offline baseline failed due memory limits on long full-context audio.")
+
     summary = {
         "mode": "streaming-matrix",
         "device": "Mac",
@@ -671,11 +722,7 @@ def run_streaming_matrix(
         "model_load_time_s": round(model_load_time, 3),
         "offline_baseline": offline_summary,
         "streaming_scenarios": scenario_summaries,
-        "notes": [
-            "Streaming mode keeps offline path untouched and is enabled only with --streaming.",
-            "MedASR is full-context trained, so chunk boundary WER degradation is expected at smaller chunks.",
-            "Subsampler/front-end state is not yet cached in this v1 implementation.",
-        ],
+        "notes": notes,
     }
     summary_path = output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
@@ -686,12 +733,15 @@ def run_streaming_matrix(
     print("=" * 60)
     print(f"Model:                   {args.model_dir} ({weights_dtype})")
     print(f"Output dir:              {output_dir}")
-    print(
-        "Offline baseline:        "
-        f"lat_p50={offline_summary['mlx_latency_p50_s']:.4f}s "
-        f"rtf_p50={offline_summary['mlx_rtf_p50']:.4f} "
-        f"wer={offline_summary['mlx_corpus_wer'] if not np.isnan(offline_summary['mlx_corpus_wer']) else 'n/a'}"
-    )
+    if np.isnan(offline_summary["mlx_latency_p50_s"]):
+        print("Offline baseline:        skipped/unavailable")
+    else:
+        print(
+            "Offline baseline:        "
+            f"lat_p50={offline_summary['mlx_latency_p50_s']:.4f}s "
+            f"rtf_p50={offline_summary['mlx_rtf_p50']:.4f} "
+            f"wer={offline_summary['mlx_corpus_wer'] if not np.isnan(offline_summary['mlx_corpus_wer']) else 'n/a'}"
+        )
     print()
     for scenario in scenario_summaries:
         wer = scenario["mlx_corpus_wer"]
