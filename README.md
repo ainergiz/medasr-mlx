@@ -1,70 +1,152 @@
-# MedASR-MLX: Record Your Doctor Visit, Get a Plain-Language Summary
+# MedASR-MLX
 
-Two HAI-DEF models running **100% on-device** via Apple MLX. Audio never leaves your phone.
+**Google's [MedASR](https://huggingface.co/google/medasr) (105M Conformer-CTC) ported to [MLX](https://github.com/ml-explore/mlx) for on-device medical speech recognition on Apple Silicon.**
 
-1. **MedASR** (105M Conformer-CTC) — medical speech-to-text
-2. **MedGemma 1.5 4B** (4-bit) — plain-language visit summary for patients
+Transcribes 43.8 seconds of medical audio in **0.09 seconds** — 470x real-time, zero cloud calls.
 
-```
-Microphone -> MedASR (0.13s) -> transcript -> MedGemma (~8s) -> patient summary
-             100% on-device, zero cloud calls, full privacy
-```
+## Models on Hugging Face
 
-## Quick Demo
+| Model | Weights | WER vs PyTorch | Notes |
+|-------|---------|----------------|-------|
+| [ainergiz/medasr-mlx-fp16](https://huggingface.co/ainergiz/medasr-mlx-fp16) | 201 MB | 0.0% | Full precision, recommended |
+| [ainergiz/medasr-mlx-int8](https://huggingface.co/ainergiz/medasr-mlx-int8) | 121 MB | 0.0% | Lossless 8-bit quantized |
+
+## Performance
+
+**Apple M4 Pro, 24 GB — 43.8s medical audio clip:**
+
+| | MedASR MLX (fp16) | MedASR MLX (int8) | HF PyTorch (fp32) |
+|---|---|---|---|
+| **Latency** | **0.09s** | 0.16s | 0.9–1.6s |
+| **Real-Time Factor** | **0.002** | 0.004 | 0.02–0.04 |
+| **Speed** | **470x real-time** | 270x real-time | 27–49x real-time |
+| **Weights** | 201 MB | 121 MB | ~421 MB |
+| **WER parity** | 0.0% | 0.0% | baseline |
+
+**6–17x faster** than HuggingFace PyTorch on Apple Silicon.
+
+## Quick Start
 
 ```bash
-# Setup
-uv venv --python 3.11 .venv
-uv pip install --python .venv/bin/python -r requirements-phase0.txt
-uv pip install --python .venv/bin/python mlx-lm
-source .venv/bin/activate
-
-# Full pipeline (MedASR + MedGemma)
-python main.py
-
-# Custom audio
-python main.py --audio your_visit.wav
-
-# Transcript only (skip MedGemma)
-python main.py --asr-only
-
-# JSON output
-python main.py --json
+git clone https://github.com/ainergiz/medasr-mlx.git
+cd medasr-mlx
+uv sync
 ```
 
-Requires HF token in `.env.local` with accepted terms for `google/medasr`.
+### Download weights
 
-## Performance (Apple M4 Pro, 24GB)
+```bash
+uv run python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('ainergiz/medasr-mlx-fp16', local_dir='artifacts/medasr-mlx-fp16')
+"
+```
 
-| Metric | fp16 | int8 | int4 |
-|--------|------|------|------|
-| Weights on disk | 201 MB | 121 MB | 79 MB |
-| Latency (43.8s audio) | 0.093s | 0.165s | 0.162s |
-| Real-Time Factor | 0.002 | 0.004 | 0.004 |
-| WER vs HF baseline | 0.0% | 0.0% | 1.25% |
+Or convert from the original yourself (needs HF token with `google/medasr` access):
 
-MedGemma visit summary: ~8s. Full pipeline: ~8s total.
+```bash
+uv sync --extra convert
+uv run python convert.py      # PyTorch → MLX fp16
+uv run python quantize.py     # fp16 → int8
+```
+
+### Transcribe
+
+```bash
+python transcribe_mlx.py --audio your_audio.wav
+
+# Streaming mode (experimental)
+python transcribe_mlx.py --audio your_audio.wav --streaming --chunk-sec 3.0
+```
+
+### Benchmark
+
+```bash
+python benchmark.py --audio-dir audio/eval-clips --with-references --mlx-only
+
+# Beam search + 6-gram KenLM
+python benchmark.py --audio-dir audio/eval-clips --with-references --mlx-only \
+  --decode-mode beam --beam-width 32 --kenlm-alpha 0.1 --kenlm-beta 0.0
+```
+
+## Architecture
+
+17-layer Conformer encoder with CTC decoding:
+
+```
+Audio (16 kHz mono)
+  │
+  ▼
+128-bin Mel Spectrogram (n_fft=512, hop=160, win=400)
+  │
+  ▼
+Subsampling: 2× Conv1d (stride 2, kernel 5) → 4x frame reduction
+  │
+  ▼
+17× Conformer Blocks
+  ├── Feed-Forward (½ residual, SiLU, 2048 intermediate)
+  ├── Multi-Head Self-Attention (8 heads × 64 dim, RoPE)
+  ├── Convolution (depthwise, kernel 32)
+  └── Feed-Forward (½ residual)
+  │
+  ▼
+CTC Head → 512-token SentencePiece vocabulary → greedy decode
+```
+
+**105M parameters.** Weights converted from PyTorch with Conv1d transposition (`[out, in, kernel]` → `[out, kernel, in]`), BatchNorm buffer handling, and verified at 100% token agreement.
+
+## Conversion Pipeline
+
+1. **`convert.py`** — PyTorch → MLX fp16 (368 parameter tensors + 51 BatchNorm buffers)
+2. **`quantize.py`** — fp16 → int8/int4 (affine, group_size=64, Linear/Embedding only)
+3. **`validate_mlx.py`** — Bit-exact parity check against HF PyTorch
+
+Key finding: Conv1d layers must stay in fp16 — quantizing them destroys accuracy for this architecture.
+
+## Streaming
+
+Cache-aware streaming is implemented (attention KV cache + convolution left-context) but experimental. MedASR was trained for full-context inference, so streaming degrades WER:
+
+| Mode | Chunk | WER | Delta vs Offline |
+|------|-------|-----|------------------|
+| Offline (full-context) | — | 0.529 | baseline |
+| Streaming | 3.0s | 0.569 | +0.039 |
+| Streaming | 1.5s | 0.674 | +0.145 |
+
+3-second chunks are the sweet spot (~4% WER increase).
 
 ## File Map
 
 | File | Purpose |
 |------|---------|
-| `main.py` | Full pipeline: audio -> transcript -> patient visit summary |
-| `model.py` | MLX Conformer-CTC encoder implementation |
-| `convert.py` | PyTorch HF -> MLX weight conversion |
-| `quantize.py` | fp16 -> int8/int4 quantization |
-| `transcribe_mlx.py` | Standalone MedASR transcription |
-| `validate_mlx.py` | HF vs MLX parity checker |
-| `benchmark.py` | Latency / RTF / memory / WER benchmarks |
+| `model.py` | MLX Conformer-CTC with streaming cache support |
+| `transcribe_mlx.py` | Standalone transcription (offline + streaming) |
+| `decode.py` | CTC decoding (greedy + beam search + KenLM) |
+| `streaming.py` | Cache-aware streaming transcriber |
+| `audio_utils.py` | Audio loading and resampling |
+| `convert.py` | PyTorch HF → MLX weight conversion |
+| `quantize.py` | MLX fp16 → int8/int4 quantization |
+| `validate_mlx.py` | HF vs MLX parity validation |
+| `benchmark.py` | WER / latency / RTF / streaming benchmarks |
 
-## Documentation
+## Related Repos
 
-- `docs/PLAN.md` — Remaining work and submission plan
-- `docs/HANDOFF.md` — Current status and reproduction steps
-- `docs/WRITEUP.md` — Competition submission writeup draft
-- `docs/LEARNINGS.md` — Technical learnings and gotchas
-- `docs/lasr-parity-checklist.md` — HF -> MLX parity requirements
+- [medasr-patient-summary](https://github.com/ainergiz/medasr-patient-summary) — Full pipeline combining MedASR + MedGemma for patient-friendly visit summaries
+- [medasr-web](https://github.com/ainergiz/medasr-web) — Browser demo (ONNX + WebGPU)
 
-## Competition
+## Requirements
 
-MedGemma Impact Challenge on Kaggle (deadline: Feb 24, 2026). Targeting the Edge AI prize category.
+- Python 3.11+
+- Apple Silicon (M1+ Mac or A17+ iPhone)
+- MLX 0.30.6+
+
+## License
+
+Model weights are governed by the [Health AI Developer Foundations Terms of Use](https://developers.google.com/health-ai-developer-foundations/terms). Source code is licensed under Apache 2.0.
+
+> HAI-DEF is provided under and subject to the Health AI Developer Foundations Terms of Use.
+
+## Acknowledgments
+
+- [Google Health AI Developer Foundations](https://developers.google.com/health-ai-developer-foundations) for MedASR
+- [Apple MLX](https://github.com/ml-explore/mlx)

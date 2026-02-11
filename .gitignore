@@ -1,4 +1,4 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[oc]
 build/
@@ -7,17 +7,50 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
 
-# Local secrets
+# Secrets
 .env
 .env.local
 env.local
 env.lcoal
 
-# Local run logs
-artifacts/phase0/run.log
+# Model weights (hosted on Hugging Face)
+artifacts/
 
-# Local external context repos
-.context/
+# Audio eval data (not redistributable)
+audio/
+
+# Training data
+data/
+
+# Web demo (WIP)
 web/
+node_modules/
+
+# Internal docs (public info is in README)
+docs/
+
+# Notebooks
+notebooks/
+
+# OS
+.DS_Store
+
+# Files belonging to other repos
+main.py
+strip_medgemma.py
+configs/
+scripts/
+
+# Legacy requirements file
+requirements-phase0.txt
+
+# Misc
+.context/
+.wrangler/
+.playwright-mcp/
+mlx_adapter/
+uv.lock
+mlx-audio-swiff-learning.md
+medasr-browser-demo-working.png

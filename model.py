@@ -104,6 +104,23 @@ class LasrCtcConfig:
         )
 
 
+@dataclass
+class ConformerLayerCache:
+    attn_key: Optional[mx.array] = None
+    attn_value: Optional[mx.array] = None
+    conv_left: Optional[mx.array] = None
+
+
+@dataclass
+class ConformerCache:
+    layers: list[ConformerLayerCache]
+    token_offset: int = 0
+
+    @classmethod
+    def empty(cls, num_layers: int) -> "ConformerCache":
+        return cls(layers=[ConformerLayerCache() for _ in range(num_layers)], token_offset=0)
+
+
 def rotate_half(x: mx.array) -> mx.array:
     half = x.shape[-1] // 2
     x1 = x[..., :half]
@@ -217,12 +234,51 @@ class LasrEncoderAttention(nn.Module):
         b, kv_h, rep, t, d = hidden_states.shape
         return mx.reshape(hidden_states, (b, kv_h * rep, t, d))
 
+    def _truncate_left_context(
+        self,
+        k: mx.array,
+        v: mx.array,
+        max_left_context: Optional[int],
+        q_len: int,
+    ) -> tuple[mx.array, mx.array]:
+        if max_left_context is None:
+            return k, v
+        keep = max(int(max_left_context), int(q_len))
+        if k.shape[2] <= keep:
+            return k, v
+        return k[:, :, -keep:, :], v[:, :, -keep:, :]
+
+    def _build_streaming_attn_bias(self, current_mask: mx.array, total_k_len: int) -> mx.array:
+        # current_mask: [B, Q] bool
+        bsz, q_len = current_mask.shape
+        past_len = total_k_len - q_len
+        if past_len < 0:
+            raise ValueError(
+                f"Invalid streaming attention lengths: total_k_len={total_k_len}, q_len={q_len}"
+            )
+        if past_len > 0:
+            past_valid = mx.ones((bsz, past_len), dtype=mx.bool_)
+            key_valid = mx.concatenate([past_valid, current_mask], axis=1)
+        else:
+            key_valid = current_mask
+        query_valid = current_mask
+        valid = (
+            mx.expand_dims(mx.expand_dims(query_valid, axis=1), axis=-1)
+            & mx.expand_dims(mx.expand_dims(key_valid, axis=1), axis=1)
+        )
+        zeros = mx.zeros(valid.shape, dtype=mx.float32)
+        neg = mx.full(valid.shape, -1e9, dtype=mx.float32)
+        return mx.where(valid, zeros, neg)
+
     def __call__(
         self,
         hidden_states: mx.array,
         position_embeddings: tuple[mx.array, mx.array],
         attention_mask: Optional[mx.array] = None,
-    ) -> mx.array:
+        cache: Optional[ConformerLayerCache] = None,
+        max_left_context: Optional[int] = None,
+        is_streaming: bool = False,
+    ) -> tuple[mx.array, Optional[ConformerLayerCache]]:
         bsz, q_len, _ = hidden_states.shape
 
         q = self.q_proj(hidden_states)
@@ -240,18 +296,47 @@ class LasrEncoderAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
+        attn_bias = attention_mask
+        layer_cache: Optional[ConformerLayerCache] = None
+        if is_streaming:
+            if cache is not None and cache.attn_key is not None:
+                k = mx.concatenate([cache.attn_key, k], axis=2)
+            if cache is not None and cache.attn_value is not None:
+                v = mx.concatenate([cache.attn_value, v], axis=2)
+            k, v = self._truncate_left_context(
+                k,
+                v,
+                max_left_context=max_left_context,
+                q_len=q_len,
+            )
+            if attention_mask is None:
+                current_mask = mx.ones((bsz, q_len), dtype=mx.bool_)
+            elif attention_mask.ndim == 2:
+                current_mask = attention_mask.astype(mx.bool_)
+            else:
+                current_mask = mx.ones((bsz, q_len), dtype=mx.bool_)
+            attn_bias = self._build_streaming_attn_bias(current_mask, total_k_len=k.shape[2])
+            layer_cache = ConformerLayerCache(
+                attn_key=k,
+                attn_value=v,
+                conv_left=cache.conv_left if cache is not None else None,
+            )
+
         k = self._repeat_kv(k, self.num_key_value_groups)
         v = self._repeat_kv(v, self.num_key_value_groups)
 
         attn_weights = mx.matmul(q, mx.transpose(k, (0, 1, 3, 2))) * self.scaling
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, : k.shape[2]]
+        if attn_bias is not None:
+            if attn_bias.ndim == 4:
+                attn_weights = attn_weights + attn_bias[:, :, :, : k.shape[2]]
+            else:
+                attn_weights = attn_weights + attn_bias
 
         attn_probs = mx.softmax(attn_weights.astype(mx.float32), axis=-1).astype(attn_weights.dtype)
         attn_output = mx.matmul(attn_probs, v)
         attn_output = mx.transpose(attn_output, (0, 2, 1, 3))
         attn_output = mx.reshape(attn_output, (bsz, q_len, self.num_heads * self.head_dim))
-        return self.o_proj(attn_output)
+        return self.o_proj(attn_output), layer_cache
 
 
 class LasrEncoderConvolutionModule(nn.Module):
@@ -292,26 +377,66 @@ class LasrEncoderConvolutionModule(nn.Module):
         right = total - left
         return mx.pad(x, ((0, 0), (left, right), (0, 0)))
 
-    def __call__(self, hidden_states: mx.array, attention_mask: Optional[mx.array] = None) -> mx.array:
+    def _masked_rows(self, attention_mask: mx.array, seq_len: int) -> mx.array:
+        # Returns [B, T] bool where True means row should be zeroed.
+        if attention_mask.ndim == 2:
+            if attention_mask.dtype == mx.bool_:
+                return ~attention_mask
+            return attention_mask == 0.0
+
+        if attention_mask.ndim == 4:
+            if attention_mask.dtype == mx.bool_:
+                all_masked_rows = mx.all(~attention_mask, axis=-1)  # [B, 1, T]
+            else:
+                all_masked_rows = mx.all(attention_mask != 0.0, axis=-1)  # [B, 1, T]
+            if all_masked_rows.shape[1] == 1:
+                all_masked_rows = mx.squeeze(all_masked_rows, axis=1)
+            return all_masked_rows
+
+        bsz = attention_mask.shape[0]
+        return mx.zeros((bsz, seq_len), dtype=mx.bool_)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        attention_mask: Optional[mx.array] = None,
+        cache: Optional[ConformerLayerCache] = None,
+        is_streaming: bool = False,
+    ) -> tuple[mx.array, Optional[mx.array]]:
         hidden_states = self.pointwise_conv1(hidden_states)
         hidden_states = self._glu(hidden_states)
 
         if attention_mask is not None:
-            # Mirror HF masking behavior for fully masked rows.
-            if attention_mask.dtype == mx.bool_:
-                all_masked_rows = mx.all(~attention_mask, axis=2)
-            else:
-                all_masked_rows = mx.all(attention_mask != 0.0, axis=2)
-            # [B, 1, T] -> [B, T, 1] for channel-last broadcast.
-            all_masked_rows = mx.transpose(all_masked_rows, (0, 2, 1))
+            all_masked_rows = self._masked_rows(attention_mask, seq_len=hidden_states.shape[1])
+            all_masked_rows = mx.expand_dims(all_masked_rows, axis=-1)
             hidden_states = mx.where(all_masked_rows, mx.zeros_like(hidden_states), hidden_states)
 
-        hidden_states = self._same_pad(hidden_states)
-        hidden_states = self.depthwise_conv(hidden_states)
+        next_conv_left = None
+        if is_streaming:
+            cache_size = self.kernel_size - 1
+            bsz, seq_len, channels = hidden_states.shape
+            if cache is not None and cache.conv_left is not None:
+                conv_left = cache.conv_left
+            else:
+                conv_left = mx.zeros((bsz, cache_size, channels), dtype=hidden_states.dtype)
+            conv_input = mx.concatenate([conv_left, hidden_states], axis=1)
+            if cache_size > 0:
+                next_conv_left = conv_input[:, -cache_size:, :]
+            else:
+                next_conv_left = mx.zeros((bsz, 0, channels), dtype=hidden_states.dtype)
+            # Stateful approximation of offline "same" padding:
+            # run depthwise conv over [cached_left + current_chunk] and keep only current positions.
+            conv_input = self._same_pad(conv_input)
+            conv_output_all = self.depthwise_conv(conv_input)
+            hidden_states = conv_output_all[:, -seq_len:, :]
+        else:
+            hidden_states = self._same_pad(hidden_states)
+            hidden_states = self.depthwise_conv(hidden_states)
+
         hidden_states = self.norm(hidden_states)
         hidden_states = nn.silu(hidden_states)
         hidden_states = self.pointwise_conv2(hidden_states)
-        return hidden_states
+        return hidden_states, next_conv_left
 
 
 class LasrEncoderFeedForward(nn.Module):
@@ -362,7 +487,10 @@ class LasrEncoderBlock(nn.Module):
         hidden_states: mx.array,
         position_embeddings: tuple[mx.array, mx.array],
         attention_mask: Optional[mx.array] = None,
-    ) -> mx.array:
+        cache: Optional[ConformerLayerCache] = None,
+        max_left_context: Optional[int] = None,
+        is_streaming: bool = False,
+    ) -> tuple[mx.array, Optional[ConformerLayerCache]]:
         residual = hidden_states
         hidden_states = self.feed_forward1(self.norm_feed_forward1(hidden_states))
         hidden_states = (
@@ -370,14 +498,22 @@ class LasrEncoderBlock(nn.Module):
             + self.feed_forward_residual_weights[1] * hidden_states
         )
 
-        attn_output = self.self_attn(
+        attn_output, attn_layer_cache = self.self_attn(
             hidden_states=self.norm_self_att(hidden_states),
             attention_mask=attention_mask,
             position_embeddings=position_embeddings,
+            cache=cache,
+            max_left_context=max_left_context,
+            is_streaming=is_streaming,
         )
         hidden_states = hidden_states + attn_output
 
-        conv_output = self.conv(self.norm_conv(hidden_states), attention_mask=attention_mask)
+        conv_output, conv_left = self.conv(
+            self.norm_conv(hidden_states),
+            attention_mask=attention_mask,
+            cache=cache,
+            is_streaming=is_streaming,
+        )
         hidden_states = (
             self.conv_residual_weights[0] * hidden_states
             + self.conv_residual_weights[1] * conv_output
@@ -390,7 +526,15 @@ class LasrEncoderBlock(nn.Module):
             + self.feed_forward_residual_weights[1] * hidden_states
         )
         hidden_states = self.norm_out(hidden_states)
-        return hidden_states
+        if not is_streaming:
+            return hidden_states, None
+
+        new_cache = ConformerLayerCache(
+            attn_key=attn_layer_cache.attn_key if attn_layer_cache is not None else None,
+            attn_value=attn_layer_cache.attn_value if attn_layer_cache is not None else None,
+            conv_left=conv_left,
+        )
+        return hidden_states, new_cache
 
 
 class LasrEncoder(nn.Module):
@@ -405,6 +549,9 @@ class LasrEncoder(nn.Module):
         self.out_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False)
         self._subsampling_kernel = config.subsampling_conv_kernel_size
         self._subsampling_stride = config.subsampling_conv_stride
+
+    def init_streaming_cache(self) -> ConformerCache:
+        return ConformerCache.empty(num_layers=len(self.layers))
 
     def _get_subsampling_output_length(self, input_lengths: mx.array) -> mx.array:
         kernel = self._subsampling_kernel
@@ -427,11 +574,28 @@ class LasrEncoder(nn.Module):
         neg = mx.full(valid.shape, -1e9, dtype=mx.float32)
         return mx.where(valid, zeros, neg)
 
-    def __call__(self, input_features: mx.array, attention_mask: Optional[mx.array] = None) -> mx.array:
+    def __call__(
+        self,
+        input_features: mx.array,
+        attention_mask: Optional[mx.array] = None,
+        cache: Optional[ConformerCache] = None,
+        is_streaming: bool = False,
+        max_left_context: Optional[int] = None,
+    ) -> mx.array | tuple[mx.array, ConformerCache]:
         hidden_states = self.subsampler(input_features)
         seq_len = hidden_states.shape[1]
 
-        position_ids = mx.arange(seq_len, dtype=mx.float32)[None, :]
+        if is_streaming:
+            if cache is None:
+                cache = self.init_streaming_cache()
+            if len(cache.layers) != len(self.layers):
+                raise ValueError(
+                    f"Invalid cache depth: got {len(cache.layers)} layer caches "
+                    f"for {len(self.layers)} encoder layers."
+                )
+            position_ids = (mx.arange(seq_len, dtype=mx.float32) + float(cache.token_offset))[None, :]
+        else:
+            position_ids = mx.arange(seq_len, dtype=mx.float32)[None, :]
         cos, sin = self.rotary_emb(hidden_states, position_ids=position_ids)
 
         if self.training and self.dropout > 0:
@@ -440,19 +604,40 @@ class LasrEncoder(nn.Module):
             cos = nn.dropout(cos, p=self.dropout_positions)
             sin = nn.dropout(sin, p=self.dropout_positions)
 
-        attn_bias = None
+        output_mask = None
         if attention_mask is not None:
             output_mask = self._get_output_attention_mask(attention_mask, target_length=seq_len)
-            attn_bias = self._create_bidirectional_mask(output_mask)
+        elif is_streaming:
+            output_mask = mx.ones((hidden_states.shape[0], seq_len), dtype=mx.bool_)
 
-        for layer in self.layers:
-            hidden_states = layer(
+        layer_attention_mask = None
+        if is_streaming:
+            layer_attention_mask = output_mask
+        elif output_mask is not None:
+            layer_attention_mask = self._create_bidirectional_mask(output_mask)
+
+        new_layer_caches: list[ConformerLayerCache] = []
+        for idx, layer in enumerate(self.layers):
+            layer_cache = cache.layers[idx] if (is_streaming and cache is not None) else None
+            hidden_states, new_layer_cache = layer(
                 hidden_states,
-                attention_mask=attn_bias,
+                attention_mask=layer_attention_mask,
                 position_embeddings=(cos, sin),
+                cache=layer_cache,
+                max_left_context=max_left_context,
+                is_streaming=is_streaming,
             )
+            if is_streaming:
+                new_layer_caches.append(new_layer_cache or ConformerLayerCache())
 
         hidden_states = self.out_norm(hidden_states)
+        if is_streaming:
+            assert cache is not None  # for type checkers
+            new_cache = ConformerCache(
+                layers=new_layer_caches,
+                token_offset=int(cache.token_offset) + int(seq_len),
+            )
+            return hidden_states, new_cache
         return hidden_states
 
 
@@ -463,7 +648,28 @@ class LasrForCTC(nn.Module):
         self.encoder = LasrEncoder(config.encoder_config)
         self.ctc_head = nn.Conv1d(config.encoder_config.hidden_size, config.vocab_size, kernel_size=1)
 
-    def __call__(self, input_features: mx.array, attention_mask: Optional[mx.array] = None) -> mx.array:
+    def init_streaming_cache(self) -> ConformerCache:
+        return self.encoder.init_streaming_cache()
+
+    def __call__(
+        self,
+        input_features: mx.array,
+        attention_mask: Optional[mx.array] = None,
+        cache: Optional[ConformerCache] = None,
+        is_streaming: bool = False,
+        max_left_context: Optional[int] = None,
+    ) -> mx.array | tuple[mx.array, ConformerCache]:
+        if is_streaming:
+            hidden_states, new_cache = self.encoder(
+                input_features=input_features,
+                attention_mask=attention_mask,
+                cache=cache,
+                is_streaming=True,
+                max_left_context=max_left_context,
+            )
+            logits = self.ctc_head(hidden_states)
+            return logits, new_cache
+
         hidden_states = self.encoder(input_features=input_features, attention_mask=attention_mask)
         logits = self.ctc_head(hidden_states)
         return logits

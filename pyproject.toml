@@ -1,7 +1,23 @@
 [project]
 name = "medasr-mlx"
 version = "0.1.0"
-description = "MedASR to MLX conversion and on-device pipeline experiments"
+description = "Google MedASR (105M Conformer-CTC) ported to MLX for Apple Silicon"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.11,<3.13"
-dependencies = []
+dependencies = [
+    "mlx>=0.30.0",
+    "numpy",
+    "soundfile",
+    "jiwer>=3.0.5",
+    "pyctcdecode>=0.5.0",
+    "kenlm>=0.3.0",
+]
+
+[project.optional-dependencies]
+convert = [
+    "transformers @ git+https://github.com/huggingface/transformers.git@65dc261512cbdb1ee72b88ae5b222f2605aad8e5",
+    "huggingface_hub>=0.30.0",
+    "torch>=2.6.0",
+    "python-dotenv>=1.0.1",
+]

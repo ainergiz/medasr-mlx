@@ -26,15 +26,18 @@ import resource
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 import jiwer
-import librosa
 import mlx.core as mx
 import numpy as np
 from dotenv import load_dotenv
 from transformers import AutoProcessor
 
+from audio_utils import load_audio_mono
+from decode import CTCTextDecoder, DecoderConfig
 from model import load_mlx_model
+from streaming import StreamingLasrTranscriber
 
 
 @dataclass
@@ -68,6 +71,11 @@ class BenchmarkSummary:
     memory_gb: float
     mlx_backend: str
     model_dir: str
+    decode_mode: str
+    kenlm_path: str | None
+    kenlm_alpha: float | None
+    kenlm_beta: float | None
+    beam_width: int | None
     weights_dtype: str
     weights_size_mb: float
     model_load_time_s: float
@@ -140,8 +148,27 @@ def load_reference(audio_path: Path) -> str | None:
     return None
 
 
+def parse_chunk_seconds(value: str) -> list[float]:
+    out: list[float] = []
+    seen: set[float] = set()
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        sec = float(raw)
+        if sec <= 0:
+            raise ValueError(f"Chunk size must be > 0, got {sec}")
+        if sec in seen:
+            continue
+        seen.add(sec)
+        out.append(sec)
+    if not out:
+        raise ValueError("No valid chunk sizes provided for --chunk-sec.")
+    return out
+
+
 def run_mlx_inference(
-    model, processor, speech: np.ndarray, sr: int
+    model, processor, decoder: CTCTextDecoder, speech: np.ndarray, sr: int
 ) -> tuple[mx.array, np.ndarray, str, float]:
     features = processor(
         speech, sampling_rate=sr, return_attention_mask=True, return_tensors="np"
@@ -154,12 +181,41 @@ def run_mlx_inference(
     mx.eval(logits)
     elapsed = time.perf_counter() - t0
 
+    logits_np = np.asarray(logits)
     pred_ids = np.asarray(mx.argmax(logits, axis=-1))
-    text = processor.batch_decode(pred_ids, skip_special_tokens=True)[0]
+    text = decoder.decode(logits_np, pred_ids=pred_ids)
     return logits, pred_ids, text, elapsed
 
 
-def run_hf_inference(hf_model, processor, speech: np.ndarray, sr: int):
+def run_mlx_streaming_inference(
+    model,
+    processor,
+    speech: np.ndarray,
+    sr: int,
+    chunk_sec: float,
+    shift_sec: float,
+    left_context_sec: float,
+) -> dict[str, float | int | str]:
+    transcriber = StreamingLasrTranscriber(
+        model=model,
+        processor=processor,
+        chunk_sec=chunk_sec,
+        shift_sec=shift_sec,
+        max_left_context_sec=left_context_sec,
+        sample_rate=sr,
+    )
+    result = transcriber.transcribe_audio(speech=speech, sr=sr)
+    return {
+        "text": result.text,
+        "latency_s": result.latency_s,
+        "rtf": result.rtf,
+        "num_chunks": result.num_chunks,
+        "cache_memory_mb": result.cache_memory_mb,
+        "token_count": result.token_count,
+    }
+
+
+def run_hf_inference(hf_model, processor, decoder: CTCTextDecoder, speech: np.ndarray, sr: int):
     import torch
 
     features = processor(
@@ -171,7 +227,7 @@ def run_hf_inference(hf_model, processor, speech: np.ndarray, sr: int):
     elapsed = time.perf_counter() - t0
 
     hf_ids = torch.argmax(hf_logits, dim=-1).cpu().numpy()
-    text = processor.batch_decode(hf_ids, skip_special_tokens=True)[0]
+    text = decoder.decode(hf_logits.detach().cpu().numpy(), pred_ids=hf_ids)
     return hf_logits, hf_ids, text, elapsed
 
 
@@ -209,24 +265,25 @@ def benchmark_clip(
     audio_path: Path,
     mlx_model,
     processor,
+    decoder: CTCTextDecoder,
     hf_model=None,
     with_references: bool = False,
     warmup_done: bool = False,
 ) -> ClipResult:
-    speech, sr = librosa.load(str(audio_path), sr=16000)
+    speech, sr = load_audio_mono(audio_path, target_sr=16000)
     audio_duration = len(speech) / sr
 
     result = ClipResult(filename=audio_path.name, audio_duration_s=audio_duration)
 
     # Warmup if first clip
     if not warmup_done:
-        mlx_logits, _, _, _ = run_mlx_inference(mlx_model, processor, speech, sr)
+        run_mlx_inference(mlx_model, processor, decoder, speech, sr)
 
     # MLX: run 3 times, take median
     mlx_latencies = []
     for _ in range(3):
         mlx_logits, mlx_ids, mlx_text, mlx_elapsed = run_mlx_inference(
-            mlx_model, processor, speech, sr
+            mlx_model, processor, decoder, speech, sr
         )
         mlx_latencies.append(mlx_elapsed)
 
@@ -237,7 +294,7 @@ def benchmark_clip(
     # HF (if available)
     if hf_model is not None:
         hf_logits, hf_ids, hf_text, hf_elapsed = run_hf_inference(
-            hf_model, processor, speech, sr
+            hf_model, processor, decoder, speech, sr
         )
         result.hf_latency_s = hf_elapsed
         result.hf_rtf = hf_elapsed / audio_duration
@@ -263,6 +320,66 @@ def benchmark_clip(
                 result.hf_cer = jiwer.cer(ref, hf_text)
 
     return result
+
+
+def benchmark_clip_streaming(
+    audio_path: Path,
+    mlx_model,
+    processor,
+    with_references: bool,
+    chunk_sec: float,
+    shift_sec: float,
+    left_context_sec: float,
+    warmup_done: bool = False,
+) -> tuple[ClipResult, int, float]:
+    speech, sr = load_audio_mono(audio_path, target_sr=16000)
+    audio_duration = len(speech) / sr
+
+    result = ClipResult(filename=audio_path.name, audio_duration_s=audio_duration)
+
+    if not warmup_done:
+        _ = run_mlx_streaming_inference(
+            mlx_model,
+            processor,
+            speech,
+            sr,
+            chunk_sec=chunk_sec,
+            shift_sec=shift_sec,
+            left_context_sec=left_context_sec,
+        )
+
+    run_rows: list[dict[str, float | int | str]] = []
+    for _ in range(3):
+        row = run_mlx_streaming_inference(
+            mlx_model,
+            processor,
+            speech,
+            sr,
+            chunk_sec=chunk_sec,
+            shift_sec=shift_sec,
+            left_context_sec=left_context_sec,
+        )
+        run_rows.append(row)
+
+    latencies = np.array([float(r["latency_s"]) for r in run_rows], dtype=np.float64)
+    median_index = int(np.argsort(latencies)[len(latencies) // 2])
+    median_run = run_rows[median_index]
+
+    result.mlx_latency_s = float(median_run["latency_s"])
+    result.mlx_rtf = result.mlx_latency_s / audio_duration
+    result.mlx_transcript = str(median_run["text"])
+
+    if with_references:
+        ref = load_reference(audio_path)
+        if ref:
+            result.mlx_wer = jiwer.wer(ref, result.mlx_transcript)
+            result.mlx_cer = jiwer.cer(ref, result.mlx_transcript)
+
+    return (
+        result,
+        int(median_run["num_chunks"]),
+        float(median_run["cache_memory_mb"]),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -297,7 +414,298 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Compute WER against .txt reference files (same stem as audio).",
     )
+    parser.add_argument(
+        "--decode-mode",
+        default="greedy",
+        choices=["greedy", "beam"],
+        help="CTC decode mode used for transcript text.",
+    )
+    parser.add_argument(
+        "--kenlm-path",
+        default=None,
+        help="Path to KenLM file for beam decoding. If omitted, downloads lm_6.kenlm from HF repo.",
+    )
+    parser.add_argument(
+        "--beam-width",
+        type=int,
+        default=128,
+        help="Beam width used when --decode-mode beam.",
+    )
+    parser.add_argument(
+        "--kenlm-alpha",
+        type=float,
+        default=0.5,
+        help="KenLM alpha weight used when --decode-mode beam.",
+    )
+    parser.add_argument(
+        "--kenlm-beta",
+        type=float,
+        default=1.0,
+        help="KenLM beta weight used when --decode-mode beam.",
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Run cache-aware streaming benchmark matrix instead of offline full-context only.",
+    )
+    parser.add_argument(
+        "--chunk-sec",
+        default="1.5",
+        help="Chunk size(s) in seconds for --streaming. Accepts comma list, e.g. 1.0,1.5,3.0.",
+    )
+    parser.add_argument(
+        "--shift-sec",
+        type=float,
+        default=None,
+        help="Chunk shift in seconds for --streaming. Defaults to chunk size.",
+    )
+    parser.add_argument(
+        "--left-context-sec",
+        type=float,
+        default=6.0,
+        help="Maximum cached left context in seconds for streaming attention KV cache.",
+    )
     return parser.parse_args()
+
+
+def run_streaming_matrix(
+    *,
+    args: argparse.Namespace,
+    audio_files: list[Path],
+    output_dir: Path,
+    mlx_model,
+    processor,
+    decoder: CTCTextDecoder,
+    weights_dtype: str,
+    weights_size_mb: float,
+    model_load_time: float,
+) -> None:
+    if args.decode_mode != "greedy":
+        raise SystemExit("Streaming benchmark currently supports only --decode-mode greedy.")
+
+    chunk_sizes = parse_chunk_seconds(args.chunk_sec)
+    if args.shift_sec is not None and args.shift_sec <= 0:
+        raise SystemExit(f"--shift-sec must be > 0, got {args.shift_sec}")
+    if args.left_context_sec <= 0:
+        raise SystemExit(f"--left-context-sec must be > 0, got {args.left_context_sec}")
+
+    print()
+    print("Running offline baseline for streaming comparison...")
+    offline_results: list[ClipResult] = []
+    for i, audio_path in enumerate(audio_files):
+        print(f"  [offline {i + 1}/{len(audio_files)}] {audio_path.name}...", end=" ", flush=True)
+        clip = benchmark_clip(
+            audio_path=audio_path,
+            mlx_model=mlx_model,
+            processor=processor,
+            decoder=decoder,
+            hf_model=None,
+            with_references=args.with_references,
+            warmup_done=(i > 0),
+        )
+        offline_results.append(clip)
+        print(f"dur={clip.audio_duration_s:.1f}s mlx_lat={clip.mlx_latency_s:.3f}s rtf={clip.mlx_rtf:.4f}")
+
+    offline_lat = np.array([r.mlx_latency_s for r in offline_results], dtype=np.float64)
+    offline_rtf = np.array([r.mlx_rtf for r in offline_results], dtype=np.float64)
+    offline_refs: list[str] = []
+    offline_hyps: list[str] = []
+    if args.with_references:
+        for r in offline_results:
+            ref = load_reference(Path(args.audio_dir) / r.filename)
+            if ref:
+                offline_refs.append(ref)
+                offline_hyps.append(r.mlx_transcript)
+    offline_corpus_wer = jiwer.wer(offline_refs, offline_hyps) if offline_refs else float("nan")
+
+    offline_summary: dict[str, Any] = {
+        "num_clips": len(offline_results),
+        "total_audio_duration_s": round(float(sum(r.audio_duration_s for r in offline_results)), 1),
+        "mlx_latency_mean_s": round(float(np.mean(offline_lat)), 4),
+        "mlx_latency_p50_s": round(float(np.percentile(offline_lat, 50)), 4),
+        "mlx_latency_p95_s": round(float(np.percentile(offline_lat, 95)), 4),
+        "mlx_rtf_mean": round(float(np.mean(offline_rtf)), 4),
+        "mlx_rtf_p50": round(float(np.percentile(offline_rtf, 50)), 4),
+        "mlx_rtf_p95": round(float(np.percentile(offline_rtf, 95)), 4),
+        "mlx_corpus_wer": offline_corpus_wer,
+        "clips": [
+            {
+                "filename": r.filename,
+                "audio_duration_s": r.audio_duration_s,
+                "mlx_latency_s": r.mlx_latency_s,
+                "mlx_rtf": r.mlx_rtf,
+                "mlx_wer": r.mlx_wer,
+            }
+            for r in offline_results
+        ],
+    }
+
+    scenario_summaries: list[dict[str, Any]] = []
+    matrix_rows: list[dict[str, Any]] = []
+    for chunk_sec in chunk_sizes:
+        shift_sec = args.shift_sec if args.shift_sec is not None else chunk_sec
+        print()
+        print(
+            "Running streaming setting "
+            f"(chunk={chunk_sec:.2f}s, shift={shift_sec:.2f}s, left_context={args.left_context_sec:.2f}s)..."
+        )
+
+        stream_results: list[ClipResult] = []
+        chunk_counts: list[int] = []
+        cache_mbs: list[float] = []
+
+        for i, audio_path in enumerate(audio_files):
+            print(f"  [stream {i + 1}/{len(audio_files)}] {audio_path.name}...", end=" ", flush=True)
+            clip, num_chunks, cache_mb = benchmark_clip_streaming(
+                audio_path=audio_path,
+                mlx_model=mlx_model,
+                processor=processor,
+                with_references=args.with_references,
+                chunk_sec=chunk_sec,
+                shift_sec=shift_sec,
+                left_context_sec=args.left_context_sec,
+                warmup_done=(i > 0),
+            )
+            stream_results.append(clip)
+            chunk_counts.append(num_chunks)
+            cache_mbs.append(cache_mb)
+            print(
+                f"dur={clip.audio_duration_s:.1f}s mlx_lat={clip.mlx_latency_s:.3f}s "
+                f"rtf={clip.mlx_rtf:.4f} chunks={num_chunks} cache={cache_mb:.2f}MB"
+            )
+
+            matrix_rows.append(
+                {
+                    "chunk_sec": chunk_sec,
+                    "shift_sec": shift_sec,
+                    "left_context_sec": args.left_context_sec,
+                    "filename": clip.filename,
+                    "audio_duration_s": clip.audio_duration_s,
+                    "mlx_latency_s": clip.mlx_latency_s,
+                    "mlx_rtf": clip.mlx_rtf,
+                    "num_chunks": num_chunks,
+                    "cache_memory_mb": cache_mb,
+                    "mlx_wer": clip.mlx_wer,
+                    "mlx_cer": clip.mlx_cer,
+                }
+            )
+
+        lat = np.array([r.mlx_latency_s for r in stream_results], dtype=np.float64)
+        rtf = np.array([r.mlx_rtf for r in stream_results], dtype=np.float64)
+        refs: list[str] = []
+        hyps: list[str] = []
+        if args.with_references:
+            for r in stream_results:
+                ref = load_reference(Path(args.audio_dir) / r.filename)
+                if ref:
+                    refs.append(ref)
+                    hyps.append(r.mlx_transcript)
+        stream_corpus_wer = jiwer.wer(refs, hyps) if refs else float("nan")
+
+        wer_delta = (
+            float(stream_corpus_wer - offline_corpus_wer)
+            if (not np.isnan(stream_corpus_wer) and not np.isnan(offline_corpus_wer))
+            else float("nan")
+        )
+
+        scenario_summary = {
+            "chunk_sec": chunk_sec,
+            "shift_sec": shift_sec,
+            "left_context_sec": args.left_context_sec,
+            "num_clips": len(stream_results),
+            "mlx_latency_mean_s": round(float(np.mean(lat)), 4),
+            "mlx_latency_p50_s": round(float(np.percentile(lat, 50)), 4),
+            "mlx_latency_p95_s": round(float(np.percentile(lat, 95)), 4),
+            "mlx_rtf_mean": round(float(np.mean(rtf)), 4),
+            "mlx_rtf_p50": round(float(np.percentile(rtf, 50)), 4),
+            "mlx_rtf_p95": round(float(np.percentile(rtf, 95)), 4),
+            "mlx_corpus_wer": stream_corpus_wer,
+            "wer_delta_vs_offline": wer_delta,
+            "num_chunks_mean": round(float(np.mean(np.array(chunk_counts, dtype=np.float64))), 2),
+            "cache_memory_mb_mean": round(float(np.mean(np.array(cache_mbs, dtype=np.float64))), 3),
+            "cache_memory_mb_p95": round(float(np.percentile(np.array(cache_mbs, dtype=np.float64), 95)), 3),
+            "clips": [
+                {
+                    "filename": r.filename,
+                    "audio_duration_s": r.audio_duration_s,
+                    "mlx_latency_s": r.mlx_latency_s,
+                    "mlx_rtf": r.mlx_rtf,
+                    "mlx_wer": r.mlx_wer,
+                    "num_chunks": n,
+                    "cache_memory_mb": c,
+                }
+                for r, n, c in zip(stream_results, chunk_counts, cache_mbs)
+            ],
+        }
+        scenario_summaries.append(scenario_summary)
+
+    csv_path = output_dir / "results_streaming_matrix.csv"
+    with csv_path.open("w", newline="") as f:
+        fieldnames = [
+            "chunk_sec",
+            "shift_sec",
+            "left_context_sec",
+            "filename",
+            "audio_duration_s",
+            "mlx_latency_s",
+            "mlx_rtf",
+            "num_chunks",
+            "cache_memory_mb",
+            "mlx_wer",
+            "mlx_cer",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(matrix_rows)
+
+    summary = {
+        "mode": "streaming-matrix",
+        "device": "Mac",
+        "chip": get_chip_name(),
+        "memory_gb": round(get_system_memory_gb(), 1),
+        "mlx_backend": str(mx.default_device()),
+        "model_dir": args.model_dir,
+        "decode_mode": args.decode_mode,
+        "weights_dtype": weights_dtype,
+        "weights_size_mb": round(weights_size_mb, 1),
+        "model_load_time_s": round(model_load_time, 3),
+        "offline_baseline": offline_summary,
+        "streaming_scenarios": scenario_summaries,
+        "notes": [
+            "Streaming mode keeps offline path untouched and is enabled only with --streaming.",
+            "MedASR is full-context trained, so chunk boundary WER degradation is expected at smaller chunks.",
+            "Subsampler/front-end state is not yet cached in this v1 implementation.",
+        ],
+    }
+    summary_path = output_dir / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+
+    print()
+    print("=" * 60)
+    print("STREAMING MATRIX SUMMARY")
+    print("=" * 60)
+    print(f"Model:                   {args.model_dir} ({weights_dtype})")
+    print(f"Output dir:              {output_dir}")
+    print(
+        "Offline baseline:        "
+        f"lat_p50={offline_summary['mlx_latency_p50_s']:.4f}s "
+        f"rtf_p50={offline_summary['mlx_rtf_p50']:.4f} "
+        f"wer={offline_summary['mlx_corpus_wer'] if not np.isnan(offline_summary['mlx_corpus_wer']) else 'n/a'}"
+    )
+    print()
+    for scenario in scenario_summaries:
+        wer = scenario["mlx_corpus_wer"]
+        delta = scenario["wer_delta_vs_offline"]
+        print(
+            f"chunk={scenario['chunk_sec']:.2f}s shift={scenario['shift_sec']:.2f}s "
+            f"lat_p50={scenario['mlx_latency_p50_s']:.4f}s rtf_p50={scenario['mlx_rtf_p50']:.4f} "
+            f"wer={(f'{wer:.4f}' if not np.isnan(wer) else 'n/a')} "
+            f"delta={(f'{delta:+.4f}' if not np.isnan(delta) else 'n/a')} "
+            f"cache_mb_mean={scenario['cache_memory_mb_mean']:.3f}"
+        )
+    print()
+    print(f"Results: {csv_path}")
+    print(f"Summary: {summary_path}")
 
 
 def main() -> None:
@@ -305,7 +713,10 @@ def main() -> None:
     args = parse_args()
 
     audio_dir = Path(args.audio_dir)
-    output_dir = Path(args.output_dir)
+    if args.streaming and args.output_dir == "artifacts/benchmark":
+        output_dir = Path("artifacts/benchmark-streaming")
+    else:
+        output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     audio_files = find_audio_files(audio_dir)
@@ -326,6 +737,21 @@ def main() -> None:
         processor = AutoProcessor.from_pretrained(str(processor_path))
     else:
         processor = AutoProcessor.from_pretrained(args.hf_model_id)
+    decoder = CTCTextDecoder(
+        processor=processor,
+        config=DecoderConfig(
+            mode=args.decode_mode,
+            hf_model_id=args.hf_model_id,
+            kenlm_path=args.kenlm_path,
+            alpha=args.kenlm_alpha,
+            beta=args.kenlm_beta,
+            beam_width=args.beam_width,
+        ),
+    )
+
+    if args.streaming and not args.mlx_only:
+        print("Streaming mode uses MLX-only path. Ignoring HF parity loading.")
+        args.mlx_only = True
 
     # Load HF model (optional)
     hf_model = None
@@ -351,6 +777,21 @@ def main() -> None:
     else:
         weights_dtype = config.get("_conversion", {}).get("weights_dtype", "unknown")
 
+    if args.streaming:
+        mx.get_peak_memory()  # read to reset
+        run_streaming_matrix(
+            args=args,
+            audio_files=audio_files,
+            output_dir=output_dir,
+            mlx_model=mlx_model,
+            processor=processor,
+            decoder=decoder,
+            weights_dtype=weights_dtype,
+            weights_size_mb=weights_size_mb,
+            model_load_time=model_load_time,
+        )
+        return
+
     # Reset memory tracking
     mx.get_peak_memory()  # read to reset
 
@@ -362,6 +803,7 @@ def main() -> None:
             audio_path=audio_path,
             mlx_model=mlx_model,
             processor=processor,
+            decoder=decoder,
             hf_model=hf_model,
             with_references=args.with_references,
             warmup_done=(i > 0),
@@ -411,6 +853,11 @@ def main() -> None:
         memory_gb=round(get_system_memory_gb(), 1),
         mlx_backend=str(mx.default_device()),
         model_dir=args.model_dir,
+        decode_mode=args.decode_mode,
+        kenlm_path=decoder.kenlm_path if args.decode_mode == "beam" else None,
+        kenlm_alpha=args.kenlm_alpha if args.decode_mode == "beam" else None,
+        kenlm_beta=args.kenlm_beta if args.decode_mode == "beam" else None,
+        beam_width=args.beam_width if args.decode_mode == "beam" else None,
         weights_dtype=weights_dtype,
         weights_size_mb=round(weights_size_mb, 1),
         model_load_time_s=round(model_load_time, 3),
@@ -466,6 +913,13 @@ def main() -> None:
     print(f"Device:                  {summary.chip} ({summary.memory_gb} GB)")
     print(f"MLX backend:             {summary.mlx_backend}")
     print(f"Model:                   {summary.model_dir} ({summary.weights_dtype})")
+    print(f"Decode mode:             {summary.decode_mode}")
+    if summary.decode_mode == "beam":
+        print(f"KenLM path:              {summary.kenlm_path}")
+        print(
+            "KenLM params:            "
+            f"beam={summary.beam_width}, alpha={summary.kenlm_alpha}, beta={summary.kenlm_beta}"
+        )
     print(f"Weights size:            {summary.weights_size_mb:.1f} MB")
     print(f"Model load time:         {summary.model_load_time_s:.3f}s")
     print(f"Clips:                   {summary.num_clips}")
