@@ -134,11 +134,6 @@ Cache-aware streaming is implemented (attention KV cache + convolution left-cont
 | `validate_mlx.py` | HF vs MLX parity validation |
 | `benchmark.py` | WER / latency / RTF / streaming benchmarks |
 
-## Related Repos
-
-- [medasr-patient-summary](https://github.com/ainergiz/medasr-patient-summary) — Full pipeline combining MedASR + MedGemma for patient-friendly visit summaries
-- [medasr-web](https://github.com/ainergiz/medasr-web) — Browser demo (ONNX + WebGPU)
-
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
