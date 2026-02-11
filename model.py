@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -55,15 +55,20 @@ class LasrEncoderConfig:
         return self.hidden_size // self.num_attention_heads
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "LasrEncoderConfig":
-        rope_parameters = d.get("rope_parameters") or {"rope_theta": 10000.0, "rope_type": "default"}
+    def from_dict(cls, d: dict[str, Any]) -> LasrEncoderConfig:
+        rope_parameters = d.get("rope_parameters") or {
+            "rope_theta": 10000.0,
+            "rope_type": "default",
+        }
         ff_weights = d.get("feed_forward_residual_weights", [1.5, 0.5])
         conv_weights = d.get("conv_residual_weights", [2.0, 1.0])
         return cls(
             hidden_size=_as_int(d.get("hidden_size"), 512),
             num_hidden_layers=_as_int(d.get("num_hidden_layers"), 17),
             num_attention_heads=_as_int(d.get("num_attention_heads"), 8),
-            num_key_value_heads=_as_int(d.get("num_key_value_heads"), _as_int(d.get("num_attention_heads"), 8)),
+            num_key_value_heads=_as_int(
+                d.get("num_key_value_heads"), _as_int(d.get("num_attention_heads"), 8)
+            ),
             intermediate_size=_as_int(d.get("intermediate_size"), 2048),
             attention_bias=bool(d.get("attention_bias", False)),
             convolution_bias=bool(d.get("convolution_bias", False)),
@@ -95,7 +100,7 @@ class LasrCtcConfig:
     encoder_config: LasrEncoderConfig
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "LasrCtcConfig":
+    def from_dict(cls, d: dict[str, Any]) -> LasrCtcConfig:
         encoder = d.get("encoder_config", d)
         return cls(
             vocab_size=_as_int(d.get("vocab_size"), 512),
@@ -106,9 +111,9 @@ class LasrCtcConfig:
 
 @dataclass
 class ConformerLayerCache:
-    attn_key: Optional[mx.array] = None
-    attn_value: Optional[mx.array] = None
-    conv_left: Optional[mx.array] = None
+    attn_key: mx.array | None = None
+    attn_value: mx.array | None = None
+    conv_left: mx.array | None = None
 
 
 @dataclass
@@ -117,7 +122,7 @@ class ConformerCache:
     token_offset: int = 0
 
     @classmethod
-    def empty(cls, num_layers: int) -> "ConformerCache":
+    def empty(cls, num_layers: int) -> ConformerCache:
         return cls(layers=[ConformerLayerCache() for _ in range(num_layers)], token_offset=0)
 
 
@@ -238,7 +243,7 @@ class LasrEncoderAttention(nn.Module):
         self,
         k: mx.array,
         v: mx.array,
-        max_left_context: Optional[int],
+        max_left_context: int | None,
         q_len: int,
     ) -> tuple[mx.array, mx.array]:
         if max_left_context is None:
@@ -262,9 +267,8 @@ class LasrEncoderAttention(nn.Module):
         else:
             key_valid = current_mask
         query_valid = current_mask
-        valid = (
-            mx.expand_dims(mx.expand_dims(query_valid, axis=1), axis=-1)
-            & mx.expand_dims(mx.expand_dims(key_valid, axis=1), axis=1)
+        valid = mx.expand_dims(mx.expand_dims(query_valid, axis=1), axis=-1) & mx.expand_dims(
+            mx.expand_dims(key_valid, axis=1), axis=1
         )
         zeros = mx.zeros(valid.shape, dtype=mx.float32)
         neg = mx.full(valid.shape, -1e9, dtype=mx.float32)
@@ -274,11 +278,11 @@ class LasrEncoderAttention(nn.Module):
         self,
         hidden_states: mx.array,
         position_embeddings: tuple[mx.array, mx.array],
-        attention_mask: Optional[mx.array] = None,
-        cache: Optional[ConformerLayerCache] = None,
-        max_left_context: Optional[int] = None,
+        attention_mask: mx.array | None = None,
+        cache: ConformerLayerCache | None = None,
+        max_left_context: int | None = None,
         is_streaming: bool = False,
-    ) -> tuple[mx.array, Optional[ConformerLayerCache]]:
+    ) -> tuple[mx.array, ConformerLayerCache | None]:
         bsz, q_len, _ = hidden_states.shape
 
         q = self.q_proj(hidden_states)
@@ -297,7 +301,7 @@ class LasrEncoderAttention(nn.Module):
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         attn_bias = attention_mask
-        layer_cache: Optional[ConformerLayerCache] = None
+        layer_cache: ConformerLayerCache | None = None
         if is_streaming:
             if cache is not None and cache.attn_key is not None:
                 k = mx.concatenate([cache.attn_key, k], axis=2)
@@ -399,10 +403,10 @@ class LasrEncoderConvolutionModule(nn.Module):
     def __call__(
         self,
         hidden_states: mx.array,
-        attention_mask: Optional[mx.array] = None,
-        cache: Optional[ConformerLayerCache] = None,
+        attention_mask: mx.array | None = None,
+        cache: ConformerLayerCache | None = None,
         is_streaming: bool = False,
-    ) -> tuple[mx.array, Optional[mx.array]]:
+    ) -> tuple[mx.array, mx.array | None]:
         hidden_states = self.pointwise_conv1(hidden_states)
         hidden_states = self._glu(hidden_states)
 
@@ -442,8 +446,12 @@ class LasrEncoderConvolutionModule(nn.Module):
 class LasrEncoderFeedForward(nn.Module):
     def __init__(self, config: LasrEncoderConfig):
         super().__init__()
-        self.linear1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=config.attention_bias)
-        self.linear2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.attention_bias)
+        self.linear1 = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=config.attention_bias
+        )
+        self.linear2 = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=config.attention_bias
+        )
         self.activation_dropout = config.activation_dropout
         self.hidden_act = config.hidden_act
 
@@ -473,11 +481,21 @@ class LasrEncoderBlock(nn.Module):
         self.feed_forward2 = LasrEncoderFeedForward(config)
 
         # HF parity requirement: LayerNorm with bias=False
-        self.norm_feed_forward1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False)
-        self.norm_self_att = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False)
-        self.norm_conv = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False)
-        self.norm_feed_forward2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False)
-        self.norm_out = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False)
+        self.norm_feed_forward1 = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False
+        )
+        self.norm_self_att = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False
+        )
+        self.norm_conv = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False
+        )
+        self.norm_feed_forward2 = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False
+        )
+        self.norm_out = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False
+        )
 
         self.feed_forward_residual_weights = config.feed_forward_residual_weights
         self.conv_residual_weights = config.conv_residual_weights
@@ -486,11 +504,11 @@ class LasrEncoderBlock(nn.Module):
         self,
         hidden_states: mx.array,
         position_embeddings: tuple[mx.array, mx.array],
-        attention_mask: Optional[mx.array] = None,
-        cache: Optional[ConformerLayerCache] = None,
-        max_left_context: Optional[int] = None,
+        attention_mask: mx.array | None = None,
+        cache: ConformerLayerCache | None = None,
+        max_left_context: int | None = None,
         is_streaming: bool = False,
-    ) -> tuple[mx.array, Optional[ConformerLayerCache]]:
+    ) -> tuple[mx.array, ConformerLayerCache | None]:
         residual = hidden_states
         hidden_states = self.feed_forward1(self.norm_feed_forward1(hidden_states))
         hidden_states = (
@@ -546,7 +564,9 @@ class LasrEncoder(nn.Module):
         self.subsampler = LasrEncoderSubsampling(config)
         self.rotary_emb = LasrEncoderRotaryEmbedding(config)
         self.layers = [LasrEncoderBlock(config) for _ in range(config.num_hidden_layers)]
-        self.out_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False)
+        self.out_norm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps, affine=True, bias=False
+        )
         self._subsampling_kernel = config.subsampling_conv_kernel_size
         self._subsampling_stride = config.subsampling_conv_stride
 
@@ -577,10 +597,10 @@ class LasrEncoder(nn.Module):
     def __call__(
         self,
         input_features: mx.array,
-        attention_mask: Optional[mx.array] = None,
-        cache: Optional[ConformerCache] = None,
+        attention_mask: mx.array | None = None,
+        cache: ConformerCache | None = None,
         is_streaming: bool = False,
-        max_left_context: Optional[int] = None,
+        max_left_context: int | None = None,
     ) -> mx.array | tuple[mx.array, ConformerCache]:
         hidden_states = self.subsampler(input_features)
         seq_len = hidden_states.shape[1]
@@ -593,7 +613,9 @@ class LasrEncoder(nn.Module):
                     f"Invalid cache depth: got {len(cache.layers)} layer caches "
                     f"for {len(self.layers)} encoder layers."
                 )
-            position_ids = (mx.arange(seq_len, dtype=mx.float32) + float(cache.token_offset))[None, :]
+            position_ids = (mx.arange(seq_len, dtype=mx.float32) + float(cache.token_offset))[
+                None, :
+            ]
         else:
             position_ids = mx.arange(seq_len, dtype=mx.float32)[None, :]
         cos, sin = self.rotary_emb(hidden_states, position_ids=position_ids)
@@ -646,7 +668,9 @@ class LasrForCTC(nn.Module):
         super().__init__()
         self.config = config
         self.encoder = LasrEncoder(config.encoder_config)
-        self.ctc_head = nn.Conv1d(config.encoder_config.hidden_size, config.vocab_size, kernel_size=1)
+        self.ctc_head = nn.Conv1d(
+            config.encoder_config.hidden_size, config.vocab_size, kernel_size=1
+        )
 
     def init_streaming_cache(self) -> ConformerCache:
         return self.encoder.init_streaming_cache()
@@ -654,10 +678,10 @@ class LasrForCTC(nn.Module):
     def __call__(
         self,
         input_features: mx.array,
-        attention_mask: Optional[mx.array] = None,
-        cache: Optional[ConformerCache] = None,
+        attention_mask: mx.array | None = None,
+        cache: ConformerCache | None = None,
         is_streaming: bool = False,
-        max_left_context: Optional[int] = None,
+        max_left_context: int | None = None,
     ) -> mx.array | tuple[mx.array, ConformerCache]:
         if is_streaming:
             hidden_states, new_cache = self.encoder(

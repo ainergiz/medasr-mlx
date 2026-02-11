@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -148,7 +148,7 @@ def build_config(model: Any, processor: Any, model_id: str, dtype_str: str) -> d
     config = model.config.to_dict()
     config["_conversion"] = {
         "source_model_id": model_id,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc": datetime.now(UTC).isoformat(),
         "weights_dtype": dtype_str,
         "converter": "convert.py",
         "weight_layout_notes": {
@@ -230,7 +230,9 @@ def write_outputs(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert Hugging Face MedASR weights to MLX format.")
+    parser = argparse.ArgumentParser(
+        description="Convert Hugging Face MedASR weights to MLX format."
+    )
     parser.add_argument("--model-id", default="google/medasr", help="Hugging Face model ID.")
     parser.add_argument(
         "--output-dir",
@@ -262,12 +264,18 @@ def main() -> None:
     print(f"[convert] Converting tensors to MLX ({args.dtype})")
     weights, report = convert_state_dict_to_mlx(state_dict, mx_dtype=mx_dtype, np_dtype=np_dtype)
 
-    config = build_config(model=model, processor=processor, model_id=args.model_id, dtype_str=args.dtype)
+    config = build_config(
+        model=model, processor=processor, model_id=args.model_id, dtype_str=args.dtype
+    )
     output_dir = Path(args.output_dir)
-    write_outputs(output_dir=output_dir, weights=weights, config=config, report=report, processor=processor)
+    write_outputs(
+        output_dir=output_dir, weights=weights, config=config, report=report, processor=processor
+    )
 
     print("[convert] Done")
-    print(f"[convert] Tensors: {report['num_output_tensors']} (skipped {report['num_skipped_tensors']})")
+    print(
+        f"[convert] Tensors: {report['num_output_tensors']} (skipped {report['num_skipped_tensors']})"
+    )
     print(f"[convert] Output: {output_dir}")
 
 
@@ -276,6 +284,8 @@ if __name__ == "__main__":
         main()
     except HfHubHTTPError as exc:
         print("[convert] Hugging Face access error.")
-        print("[convert] Ensure you accepted terms for google/medasr and set HF_TOKEN in .env.local.")
+        print(
+            "[convert] Ensure you accepted terms for google/medasr and set HF_TOKEN in .env.local."
+        )
         print(f"[convert] Details: {exc}")
         raise SystemExit(2) from exc

@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable, Optional
 
 import mlx.core as mx
 import numpy as np
@@ -31,7 +31,7 @@ class StreamingLasrTranscriber:
         model,
         processor,
         chunk_sec: float = 1.5,
-        shift_sec: Optional[float] = None,
+        shift_sec: float | None = None,
         max_left_context_sec: float = 6.0,
         sample_rate: int = 16000,
         encoder_frame_sec: float = 0.04,
@@ -55,10 +55,12 @@ class StreamingLasrTranscriber:
         self.max_left_context_sec = float(max_left_context_sec)
         self.sample_rate = int(sample_rate)
         self.encoder_frame_sec = float(encoder_frame_sec)
-        self.max_left_context_tokens = max(1, int(round(self.max_left_context_sec / self.encoder_frame_sec)))
+        self.max_left_context_tokens = max(
+            1, round(self.max_left_context_sec / self.encoder_frame_sec)
+        )
 
-        self.chunk_samples = max(1, int(round(self.chunk_sec * self.sample_rate)))
-        self.shift_samples = max(1, int(round(self.shift_sec * self.sample_rate)))
+        self.chunk_samples = max(1, round(self.chunk_sec * self.sample_rate))
+        self.shift_samples = max(1, round(self.shift_sec * self.sample_rate))
         # Conservative lower bound to keep LASR subsampler conv stack valid on short tail chunks.
         self.min_chunk_samples = 2400
         self.blank_id = 0
@@ -142,7 +144,7 @@ class StreamingLasrTranscriber:
 
         frame_ids = np.asarray(mx.argmax(logits, axis=-1))[0]
         if keep_tail_fraction < 1.0 and frame_ids.size > 0:
-            keep = max(1, int(round(frame_ids.size * keep_tail_fraction)))
+            keep = max(1, round(frame_ids.size * keep_tail_fraction))
             frame_ids = frame_ids[-keep:]
 
         new_tokens = self._collapse_ctc_with_state(frame_ids)

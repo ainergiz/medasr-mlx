@@ -6,7 +6,7 @@ import json
 import shutil
 import time
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -95,7 +95,7 @@ def _build_quantized_config(
         "mode": mode,
         "target_modules": "mlx.nn.quantize default predicate (Linear/Embedding layers)",
         "source_model_dir": str(input_model_dir),
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc": datetime.now(UTC).isoformat(),
         "notes": [
             "Convolution layers remain non-quantized with this path.",
             "Model loader applies nn.quantize() before loading quantized weights.",
@@ -130,7 +130,7 @@ def _write_report(
         compression_ratio = source_size_mb / output_size_mb if output_size_mb > 0 else 0.0
 
     report = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc": datetime.now(UTC).isoformat(),
         "source_model_dir": str(input_model_dir),
         "output_model_dir": str(output_dir),
         "quantization": {
@@ -156,7 +156,9 @@ def main() -> None:
     args = parse_args()
 
     input_dir = Path(args.input_model_dir)
-    output_dir = Path(args.output_dir) if args.output_dir else Path(f"artifacts/medasr-mlx-int{args.bits}")
+    output_dir = (
+        Path(args.output_dir) if args.output_dir else Path(f"artifacts/medasr-mlx-int{args.bits}")
+    )
     input_config_path = input_dir / "config.json"
     input_weights_path = input_dir / "weights.npz"
 

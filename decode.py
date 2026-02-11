@@ -107,9 +107,7 @@ class CTCTextDecoder:
                 pred_ids = np.argmax(logits, axis=-1)
             return self.processor.batch_decode(pred_ids, skip_special_tokens=True)[0]
 
-        if self._beam_decoder is None:
-            self._ensure_beam_decoder(logits.shape[-1])
-        elif self._beam_decoder_vocab_size != logits.shape[-1]:
+        if self._beam_decoder is None or self._beam_decoder_vocab_size != logits.shape[-1]:
             self._ensure_beam_decoder(logits.shape[-1])
         # pyctcdecode expects [T, V] for a single utterance.
         text = self._beam_decoder.decode(logits[0], beam_width=self.config.beam_width)

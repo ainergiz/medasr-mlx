@@ -16,6 +16,7 @@ Usage:
 
 Output: artifacts/benchmark/results.csv + artifacts/benchmark/summary.json
 """
+
 from __future__ import annotations
 
 import argparse
@@ -116,9 +117,7 @@ def get_chip_name() -> str:
     try:
         import subprocess
 
-        out = subprocess.check_output(
-            ["system_profiler", "SPHardwareDataType"], text=True
-        )
+        out = subprocess.check_output(["system_profiler", "SPHardwareDataType"], text=True)
         for line in out.splitlines():
             if "Chip" in line:
                 return line.split(":")[-1].strip()
@@ -170,9 +169,7 @@ def parse_chunk_seconds(value: str) -> list[float]:
 def run_mlx_inference(
     model, processor, decoder: CTCTextDecoder, speech: np.ndarray, sr: int
 ) -> tuple[mx.array, np.ndarray, str, float]:
-    features = processor(
-        speech, sampling_rate=sr, return_attention_mask=True, return_tensors="np"
-    )
+    features = processor(speech, sampling_rate=sr, return_attention_mask=True, return_tensors="np")
     input_features = mx.array(features["input_features"])
     attention_mask = mx.array(features["attention_mask"].astype(np.bool_))
 
@@ -218,9 +215,7 @@ def run_mlx_streaming_inference(
 def run_hf_inference(hf_model, processor, decoder: CTCTextDecoder, speech: np.ndarray, sr: int):
     import torch
 
-    features = processor(
-        speech, sampling_rate=sr, return_attention_mask=True, return_tensors="pt"
-    )
+    features = processor(speech, sampling_rate=sr, return_attention_mask=True, return_tensors="pt")
     t0 = time.perf_counter()
     with torch.no_grad():
         hf_logits = hf_model(**features).logits
@@ -255,8 +250,6 @@ def compute_parity(
         max_diff = float("nan")
         mean_diff = float("nan")
 
-    hf_text_dummy = "a"
-    mlx_text_dummy = "a"
     wer = 0.0 if token_agreement == 1.0 else float("nan")
     return wer, token_agreement, max_diff, mean_diff
 
@@ -301,9 +294,7 @@ def benchmark_clip(
         result.hf_transcript = hf_text
 
         # Parity
-        wer, tok_agree, max_diff, mean_diff = compute_parity(
-            mlx_logits, mlx_ids, hf_logits, hf_ids
-        )
+        wer, tok_agree, max_diff, mean_diff = compute_parity(mlx_logits, mlx_ids, hf_logits, hf_ids)
         result.parity_wer = wer
         result.parity_token_agreement = tok_agree
         result.parity_max_logit_diff = max_diff
@@ -507,7 +498,11 @@ def run_streaming_matrix(
         print("Running offline baseline for streaming comparison...")
         try:
             for i, audio_path in enumerate(audio_files):
-                print(f"  [offline {i + 1}/{len(audio_files)}] {audio_path.name}...", end=" ", flush=True)
+                print(
+                    f"  [offline {i + 1}/{len(audio_files)}] {audio_path.name}...",
+                    end=" ",
+                    flush=True,
+                )
                 clip = benchmark_clip(
                     audio_path=audio_path,
                     mlx_model=mlx_model,
@@ -547,7 +542,9 @@ def run_streaming_matrix(
 
         offline_summary: dict[str, Any] = {
             "num_clips": len(offline_results),
-            "total_audio_duration_s": round(float(sum(r.audio_duration_s for r in offline_results)), 1),
+            "total_audio_duration_s": round(
+                float(sum(r.audio_duration_s for r in offline_results)), 1
+            ),
             "mlx_latency_mean_s": round(float(np.mean(offline_lat)), 4),
             "mlx_latency_p50_s": round(float(np.percentile(offline_lat, 50)), 4),
             "mlx_latency_p95_s": round(float(np.percentile(offline_lat, 95)), 4),
@@ -596,7 +593,9 @@ def run_streaming_matrix(
         cache_mbs: list[float] = []
 
         for i, audio_path in enumerate(audio_files):
-            print(f"  [stream {i + 1}/{len(audio_files)}] {audio_path.name}...", end=" ", flush=True)
+            print(
+                f"  [stream {i + 1}/{len(audio_files)}] {audio_path.name}...", end=" ", flush=True
+            )
             clip, num_chunks, cache_mb = benchmark_clip_streaming(
                 audio_path=audio_path,
                 mlx_model=mlx_model,
@@ -664,7 +663,9 @@ def run_streaming_matrix(
             "wer_delta_vs_offline": wer_delta,
             "num_chunks_mean": round(float(np.mean(np.array(chunk_counts, dtype=np.float64))), 2),
             "cache_memory_mb_mean": round(float(np.mean(np.array(cache_mbs, dtype=np.float64))), 3),
-            "cache_memory_mb_p95": round(float(np.percentile(np.array(cache_mbs, dtype=np.float64), 95)), 3),
+            "cache_memory_mb_p95": round(
+                float(np.percentile(np.array(cache_mbs, dtype=np.float64), 95)), 3
+            ),
             "clips": [
                 {
                     "filename": r.filename,
@@ -807,7 +808,6 @@ def main() -> None:
     hf_model = None
     if not args.mlx_only:
         print(f"Loading HF model {args.hf_model_id}...")
-        import torch
         from transformers import AutoModelForCTC
 
         hf_model = AutoModelForCTC.from_pretrained(args.hf_model_id)
@@ -875,8 +875,12 @@ def main() -> None:
     gpu_active = mx.get_active_memory() / (1024 * 1024)
     rss_peak = get_rss_mb()
 
-    parity_agreements = [r.parity_token_agreement for r in results if not np.isnan(r.parity_token_agreement)]
-    parity_max_diffs = [r.parity_max_logit_diff for r in results if not np.isnan(r.parity_max_logit_diff)]
+    parity_agreements = [
+        r.parity_token_agreement for r in results if not np.isnan(r.parity_token_agreement)
+    ]
+    parity_max_diffs = [
+        r.parity_max_logit_diff for r in results if not np.isnan(r.parity_max_logit_diff)
+    ]
 
     # Corpus-level WER (concatenate all transcripts)
     mlx_corpus_wer = float("nan")
@@ -922,9 +926,15 @@ def main() -> None:
         gpu_peak_memory_mb=round(gpu_peak, 1),
         gpu_active_memory_mb=round(gpu_active, 1),
         process_rss_peak_mb=round(rss_peak, 1),
-        parity_all_wer_zero=all(r.parity_wer == 0.0 for r in results) if parity_agreements else False,
-        parity_mean_token_agreement=round(float(np.mean(parity_agreements)), 6) if parity_agreements else 0.0,
-        parity_max_logit_diff=round(float(np.max(parity_max_diffs)), 6) if parity_max_diffs else 0.0,
+        parity_all_wer_zero=all(r.parity_wer == 0.0 for r in results)
+        if parity_agreements
+        else False,
+        parity_mean_token_agreement=round(float(np.mean(parity_agreements)), 6)
+        if parity_agreements
+        else 0.0,
+        parity_max_logit_diff=round(float(np.max(parity_max_diffs)), 6)
+        if parity_max_diffs
+        else 0.0,
         mlx_corpus_wer=mlx_corpus_wer,
         hf_corpus_wer=hf_corpus_wer,
         clips=results,
@@ -933,11 +943,22 @@ def main() -> None:
     # Write CSV
     csv_path = output_dir / "results.csv"
     fieldnames = [
-        "filename", "audio_duration_s",
-        "mlx_latency_s", "mlx_rtf", "mlx_transcript",
-        "hf_latency_s", "hf_rtf", "hf_transcript",
-        "parity_wer", "parity_token_agreement", "parity_max_logit_diff", "parity_mean_logit_diff",
-        "mlx_wer", "mlx_cer", "hf_wer", "hf_cer",
+        "filename",
+        "audio_duration_s",
+        "mlx_latency_s",
+        "mlx_rtf",
+        "mlx_transcript",
+        "hf_latency_s",
+        "hf_rtf",
+        "hf_transcript",
+        "parity_wer",
+        "parity_token_agreement",
+        "parity_max_logit_diff",
+        "parity_mean_logit_diff",
+        "mlx_wer",
+        "mlx_cer",
+        "hf_wer",
+        "hf_cer",
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -951,8 +972,16 @@ def main() -> None:
     summary_dict = asdict(summary)
     # Clean up clips for JSON (remove long transcript strings from summary level)
     for clip in summary_dict["clips"]:
-        clip["mlx_transcript"] = clip["mlx_transcript"][:200] + "..." if len(clip["mlx_transcript"]) > 200 else clip["mlx_transcript"]
-        clip["hf_transcript"] = clip["hf_transcript"][:200] + "..." if len(clip["hf_transcript"]) > 200 else clip["hf_transcript"]
+        clip["mlx_transcript"] = (
+            clip["mlx_transcript"][:200] + "..."
+            if len(clip["mlx_transcript"]) > 200
+            else clip["mlx_transcript"]
+        )
+        clip["hf_transcript"] = (
+            clip["hf_transcript"][:200] + "..."
+            if len(clip["hf_transcript"]) > 200
+            else clip["hf_transcript"]
+        )
     summary_path.write_text(json.dumps(summary_dict, indent=2) + "\n")
 
     # Print summary
