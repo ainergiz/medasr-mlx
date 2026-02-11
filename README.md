@@ -25,6 +25,11 @@ Transcribes 43.8 seconds of medical audio in **0.09 seconds** — 470x real-time
 
 **6–17x faster** than HuggingFace PyTorch on Apple Silicon.
 
+## Prerequisites
+
+- Apple Silicon Mac (M1+) or iPhone (A17+)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) — fast Python package manager
+
 ## Quick Start
 
 ```bash
@@ -53,19 +58,19 @@ uv run python quantize.py     # fp16 → int8
 ### Transcribe
 
 ```bash
-python transcribe_mlx.py --audio your_audio.wav
+uv run python transcribe_mlx.py --audio your_audio.wav
 
 # Streaming mode (experimental)
-python transcribe_mlx.py --audio your_audio.wav --streaming --chunk-sec 3.0
+uv run python transcribe_mlx.py --audio your_audio.wav --streaming --chunk-sec 3.0
 ```
 
 ### Benchmark
 
 ```bash
-python benchmark.py --audio-dir audio/eval-clips --with-references --mlx-only
+uv run python benchmark.py --audio-dir audio/eval-clips --with-references --mlx-only
 
 # Beam search + 6-gram KenLM
-python benchmark.py --audio-dir audio/eval-clips --with-references --mlx-only \
+uv run python benchmark.py --audio-dir audio/eval-clips --with-references --mlx-only \
   --decode-mode beam --beam-width 32 --kenlm-alpha 0.1 --kenlm-beta 0.0
 ```
 
@@ -136,7 +141,8 @@ Cache-aware streaming is implemented (attention KV cache + convolution left-cont
 
 ## Requirements
 
-- Python 3.11+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- Python 3.11+ (managed by uv)
 - Apple Silicon (M1+ Mac or A17+ iPhone)
 - MLX 0.30.6+
 
