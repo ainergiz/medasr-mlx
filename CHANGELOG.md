@@ -17,7 +17,7 @@ still loads.
 - **Streaming** with Temporal Posterior Fusion. It runs the *unmodified*
   full-context model on sliding windows and reports committed and tentative
   text, then makes a final second pass. Presets are `paper` (20 s / 320 ms),
-  `balanced` and `low-power`. The stream start is padded as in the report, but
+  `responsive` and `efficient` (the default). The stream start is padded as in the report, but
   with a -60 dBFS noise floor instead of digital silence, which removes a
   spurious `]` token at speech onset.
 - **Word timestamps and confidences**, segments, and `txt` / `json` / `srt` /

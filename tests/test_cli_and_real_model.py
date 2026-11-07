@@ -36,7 +36,7 @@ def test_cli_beam_hotwords_eval_stream(tiny_checkpoint, wav_file, capsys):
     assert main(["eval", str(wav_file.parent), *model]) == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["utterances"] == 1 and summary["cer"] >= 0.0
-    assert main(["stream", str(wav_file), *model, "--preset", "low-power"]) == 0
+    assert main(["stream", str(wav_file), *model, "--preset", "efficient"]) == 0
 
 
 def test_cli_convert_quantized(tiny_checkpoint, tmp_path, wav_file):

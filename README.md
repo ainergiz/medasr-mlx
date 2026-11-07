@@ -101,15 +101,18 @@ about the same.
 | Mode | Short clips (119 Eka) WER | Long-form (8 sessions, 7 min) WER | Model compute vs offline |
 |---|---|---|---|
 | offline TPF (reference) | 14.8% | 30.8% | 1× |
-| `low-power` (6 s windows / 1.28 s stride) | 15.2% | 30.7% | ≈ 4.7× |
-| `low-power`, final second pass | — | 30.5% | — |
+| `efficient` (default; 6 s windows / 1.28 s stride) | 15.2% | 30.7% | ≈ 4.7× |
+| `efficient`, final second pass | — | 30.5% | — |
+| `responsive` (10 s / 0.64 s: updates twice as often) | — | 33.5% | ≈ 15.6× |
+| `responsive`, final second pass | — | 31.8% | — |
 
-Committed text, which never changes once shown, is within half a point of offline accuracy on these sets, and
-a word commits once it has 1.5 s of right context (`commit_delay_s`), so 1.5 s plus up to one stride after
-it is spoken. Start-of-stream handling matters: on the
-same 119 clips, growing the first windows gave 16.3%, the report's zero padding 15.6%, and v2's noise-floor
-padding 15.2%. `paper` (20 s / 0.32 s) is the report's setting at about 62× offline compute. That is affordable
-on a Mac GPU but was too slow to evaluate on this CPU box.
+With the default `efficient` preset, committed text (which never changes once shown) is within half a point
+of offline accuracy on these sets. A word commits once it has 1.5 s of right context (`commit_delay_s`), so
+1.5 s plus up to one stride after it is spoken. `responsive` refreshes twice as often but measured worse here.
+The long-form sample is small (907 words), so treat preset differences of a point or two as noise.
+Start-of-stream handling matters: on the same 119 clips, growing the first windows gave 16.3%, the report's zero padding 15.6%, and v2's noise-floor
+padding 15.2%. `paper` (20 s / 0.32 s) is the report's setting at about 62× offline compute. That should fit a Mac
+GPU's budget but is unmeasured; it was too slow to evaluate on this CPU box.
 
 **Quantization: weights stored in each format, 70 clips, fp32 compute**
 
@@ -200,12 +203,12 @@ On Python ≥ 3.13 the PyPI `kenlm` sdist does not build; use
 ### Streaming
 
 ```bash
-medasr stream --mic --preset balanced
+medasr stream --mic                       # --preset responsive for faster updates
 medasr stream dictation.wav --realtime          # simulate a live feed from a file
 ```
 
 ```python
-stream = asr.stream(preset="balanced")          # "paper" (20 s / 0.32 s), "balanced" (10 s / 0.64 s), "low-power" (6 s / 1.28 s)
+stream = asr.stream()                           # preset "efficient" (6 s / 1.28 s); "responsive" (10 s / 0.64 s); "paper" (20 s / 0.32 s)
 for chunk in mic_chunks():                      # any chunk size, 16 kHz float32
     update = stream.push(chunk)
     render(update.committed_text, update.tentative_text)
@@ -274,7 +277,7 @@ Long-form and streaming wrap this in Temporal Posterior Fusion (`fusion.py`, `st
 | v1 | v2 |
 |---|---|
 | `python transcribe_mlx.py --audio a.wav` | `medasr transcribe a.wav` |
-| `--streaming --chunk-sec 3.0` | `medasr stream a.wav --preset balanced` |
+| `--streaming --chunk-sec 3.0` | `medasr stream a.wav` |
 | `--decode-mode beam --kenlm-path lm.kenlm` | `--decoder beam --lm lm.kenlm` |
 | `python convert.py` + `python quantize.py` | `medasr convert --source google/medasr --output DIR [--bits 8]` |
 | `python benchmark.py --with-references` | `medasr eval DIR_OR_MANIFEST`, `medasr bench a.wav` |

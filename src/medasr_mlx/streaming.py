@@ -46,8 +46,10 @@ class StreamingPreset:
 PRESETS = {
     # The report's streaming setting: 20 s windows every 320 ms.
     "paper": StreamingPreset(20.0, 0.32, 1.5),
-    "balanced": StreamingPreset(10.0, 0.64, 1.5),
-    "low-power": StreamingPreset(6.0, 1.28, 1.5),
+    # Measured on 8 Eka sessions: committed WER 30.7% (= offline 30.8%) at ~4.7x offline compute.
+    "efficient": StreamingPreset(6.0, 1.28, 1.5),
+    # Twice the update rate at ~15.6x compute (33.5% committed WER on the same sessions).
+    "responsive": StreamingPreset(10.0, 0.64, 1.5),
 }
 
 
@@ -67,14 +69,14 @@ class StreamingTranscriber:
         self,
         asr: MedASR,
         *,
-        preset: str | None = "balanced",
+        preset: str | None = "efficient",
         window_s: float | None = None,
         stride_s: float | None = None,
         commit_delay_s: float | None = None,
         start_padding: bool = True,
         padding_noise: float = 1e-3,
     ) -> None:
-        base = PRESETS[preset] if preset else PRESETS["balanced"]
+        base = PRESETS[preset or "efficient"]
         cfg = asr.config
         self.asr = asr
         self.sr = cfg.frontend.sample_rate
