@@ -64,7 +64,7 @@ prepared with `tools/prepare_eval_data.py` and scored with `medasr eval`'s norma
 | Tokenizer decode vs `LasrTokenizer` (3,000 random CTC paths) | 0 mismatches |
 | Architecture vs `transformers.LasrForCTC` (random tiny config, in CI) | max \|Δlogit\| < 2e-4 |
 | v2 vs v1 transcripts, 70 real clips (≤ 20 s) | 70/70 identical, 99.993% frame argmax agreement |
-| true fp16 (stabilised) vs fp32 | 99.91% frame agreement, 12/12 identical transcripts (bf16: 99.50%, 11/12) |
+| true fp16 (stabilised) vs fp32 | 99.95% frame agreement, 12/12 identical transcripts (bf16: 99.50%, 11/12) |
 
 **Medical terms: 710 Eka clips, 122 min, 2,902 annotated entities**
 
@@ -96,9 +96,34 @@ MedASR is fine-tuned on segments of at most 20 s, and accuracy falls off sharply
 context. TPF fixes this and keeps memory bounded. Hann averaging and hard per-frame window selection performed
 about the same.
 
-STREAMING_PLACEHOLDER
+**Streaming (Temporal Posterior Fusion), committed text unless noted**
 
-QUANT_PLACEHOLDER
+| Mode | Short clips (119 Eka) WER | Long-form (8 sessions, 7 min) WER | Model compute vs offline |
+|---|---|---|---|
+| offline TPF (reference) | 14.8% | 30.8% | 1× |
+| `low-power` (6 s windows / 1.28 s stride) | 15.2% | 30.7% | ≈ 4.7× |
+| `low-power`, final second pass | — | 30.5% | — |
+
+Committed text, which never changes once shown, is within half a point of offline accuracy on these sets, and
+a word commits once it has 1.5 s of right context (`commit_delay_s`), so 1.5 s plus up to one stride after
+it is spoken. Start-of-stream handling matters: on the
+same 119 clips, growing the first windows gave 16.3%, the report's zero padding 15.6%, and v2's noise-floor
+padding 15.2%. `paper` (20 s / 0.32 s) is the report's setting at about 62× offline compute. That is affordable
+on a Mac GPU but was too slow to evaluate on this CPU box.
+
+**Quantization: weights stored in each format, 70 clips, fp32 compute**
+
+| Format | Weights | Frame agreement vs fp32 | Identical transcripts | WER |
+|---|---|---|---|---|
+| fp16 | 201 MB | 100% | 70/70 | 20.9% |
+| int8 (affine, group 64) | 109 MB | 99.75% | 57/70 | 21.0% |
+| int4 (affine, group 64) | 60 MB | 97.1% | 20/70 | 22.0% |
+
+int8 is the practical sweet spot. It is smaller than v1's int8 (121 MB) because v2 also quantizes the pointwise
+convolutions, now Linear layers, and transcripts change only in rare words. The subsampler and CTC head stay in
+fp16 by default (`--quantize-io` to include them). MLX's microscaling formats (`--mode mxfp8` / `mxfp4`,
+group 32) are supported, and fp16 compute rescales their power-of-two scales exactly (unit-tested), but they
+were not benchmarked on real audio for this release. `nvfp4` checkpoints compute in bf16.
 
 ## Install
 
