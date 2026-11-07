@@ -54,3 +54,8 @@ mlx_adapter/
 uv.lock
 mlx-audio-swiff-learning.md
 medasr-browser-demo-working.png
+
+# v2 tooling
+eval-data/
+.pytest_cache/
+.ruff_cache/
