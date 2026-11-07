@@ -2,11 +2,12 @@
 
 The model itself is unchanged. Every ``stride`` seconds the most recent
 ``window`` seconds of audio are recognised, and the window's posteriors are
-Hann-fused into a running per-frame average. By default windows simply grow
-until they are full. ``start_padding=True`` instead left-pads the stream with
-``window`` seconds of digital silence so the first window ends at time zero
-(the report's recipe); on our evaluation that padding makes the model emit
-spurious ``]`` tokens at speech onset, so it is off by default.
+Hann-fused into a running per-frame average. As in the report, the stream is
+left-padded with ``window`` seconds of silence so every window is full length
+and the first one ends at time zero. That padding measured better than growing
+windows (``start_padding=False``): 15.6% vs 16.3% committed WER on 119 Eka clips.
+Digital zeros make the model emit a spurious ``]`` at speech onset, so the
+padding carries a -60 dBFS noise floor (``padding_noise``), which removed it.
 
 Each update reports
 
@@ -70,7 +71,8 @@ class StreamingTranscriber:
         window_s: float | None = None,
         stride_s: float | None = None,
         commit_delay_s: float | None = None,
-        start_padding: bool = False,
+        start_padding: bool = True,
+        padding_noise: float = 1e-3,
     ) -> None:
         base = PRESETS[preset] if preset else PRESETS["balanced"]
         cfg = asr.config
@@ -86,12 +88,15 @@ class StreamingTranscriber:
             raise ValueError("stride_s must not exceed window_s")
         self.window = max(self.window, cfg.min_samples + self.spf)
         self.start_padding = start_padding
+        self.padding_noise = float(padding_noise)
         self.pad = self.window if start_padding else 0
         self.reset()
 
     # ------------------------------------------------------------------ state
     def reset(self) -> None:
-        self._audio = np.zeros(self.pad, np.float32)  # padded-coordinate buffer
+        # padded-coordinate buffer; the padding is deterministic low-level noise
+        noise = np.random.default_rng(0).standard_normal(self.pad) * self.padding_noise
+        self._audio = noise.astype(np.float32)
         self._buf_start = 0  # padded sample index of _audio[0]
         self.num_samples = 0  # real samples received
         self._next_end = self.stride  # next window end (real samples)
@@ -213,6 +218,7 @@ class StreamingTranscriber:
                 "stride_s": self.stride / self.sr,
                 "commit_delay_s": self.commit_delay_s,
                 "start_padding": self.start_padding,
+                "padding_noise": self.padding_noise,
                 "windows_run": self.windows_run,
                 "compute_s": round(self.compute_seconds, 4),
                 "rtf": round(self.compute_seconds / max(self.audio_seconds, 1e-9), 5),

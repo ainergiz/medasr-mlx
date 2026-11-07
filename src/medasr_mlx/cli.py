@@ -289,7 +289,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--window", type=float, default=None)
     p.add_argument("--stride", type=float, default=None)
     p.add_argument("--commit-delay", type=float, default=None)
-    p.add_argument("--start-padding", action="store_true", help="paper-style zero padding")
+    p.add_argument("--no-start-padding", dest="start_padding", action="store_false",
+                   help="grow the first windows instead of padding the stream start")  # fmt: skip
     p.add_argument("--chunk", type=float, default=0.1, help="audio chunk size in seconds")
     _add_model_args(p)
     p.set_defaults(func=cmd_stream)

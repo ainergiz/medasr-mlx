@@ -26,8 +26,8 @@ v1 was a faithful MLX port of the model. v2 builds on what has happened since, s
 
 | | v1 | v2 |
 |---|---|---|
-| Long audio | one full-context pass (O(T²) memory, OOM on long files) | **Temporal Posterior Fusion**: the report's 20 s sliding windows with Hann-weighted posterior fusion, bounded memory |
-| Streaming | KV-cache chunks, a regime the model was never trained for (+4% WER at 3 s chunks, +15% at 1.5 s) | **TPF streaming** (report §3.4): the unmodified model on sliding windows, with committed/tentative text and a final second pass |
+| Long audio | one full-context pass: O(T²) memory (OOM on long files), and accuracy collapses past the 20 s training length (32.6% WER on 2.7-min readings) | **Temporal Posterior Fusion**: the report's 20 s sliding windows with Hann-weighted posterior fusion, bounded memory (20.6%) |
+| Streaming | KV-cache chunks, a regime the model was never trained for (+3.9 WER points at 3 s chunks, +14.5 at 1.5 s) | **TPF streaming** (report §3.4): the unmodified model on sliding windows, with committed/tentative text and a final second pass |
 | Medical vocabulary | none | **Context biasing**: boost a medication list, formulary or template terms during beam search |
 | Decoding | greedy, or pyctcdecode (unmaintained, pins `numpy<2`) | native CTC prefix beam search with token-level KenLM fusion (`lm_6.kenlm`) and hotwords |
 | Output | text | text, **word timestamps and confidences**, segments, JSON / SRT / VTT |
@@ -35,7 +35,7 @@ v1 was a faithful MLX port of the model. v2 builds on what has happened since, s
 | Precision | "fp16" weights, but activations silently promoted to fp32 | **true fp16** through exact power-of-two rescaling (MedASR's activations reach about 2e6, far past fp16's 65504) |
 | Kernels | hand-written attention and RoPE | `mx.fast` SDPA and RoPE, folded BatchNorm, quantizable pointwise layers, `mx.compile` on GPU |
 | Checkpoints | `.npz` from a torch conversion script | loads `google/medasr` directly (no torch), v1 `.npz`, and v2 safetensors; int4/int8/mxfp4/mxfp8 |
-| Quality gates | manual scripts | 61 tests (incl. parity with transformers' `LasrForCTC`), CI, eval harness with medical-term metrics |
+| Quality gates | manual scripts | 63 tests (incl. parity with transformers' `LasrForCTC`), CI, eval harness with medical-term metrics |
 
 The wider ASR landscape informed the design. Open leaderboards have moved to streaming-capable and LLM-decoder
 models ([Open ASR Leaderboard](https://huggingface.co/blog/open-asr-leaderboard)), and MLX ports now stream
@@ -50,7 +50,55 @@ live dictation, and patient-specific vocabulary.
 
 ## Results
 
-RESULTS_PLACEHOLDER
+All numbers below were measured for this release on real audio with the public `ainergiz/medasr-mlx-fp16`
+weights. They ran on a 4-core x86 Linux box using MLX's CPU backend, so the Apple Silicon speed figures are
+still to come (see Roadmap). Datasets are the public [Eka Medical ASR](https://huggingface.co/datasets/ekacare/eka-medical-asr-evaluation-dataset)
+English test set (Indian-accented clinical speech, drug brands; MIT) and LibriSpeech dev-clean readings, both
+prepared with `tools/prepare_eval_data.py` and scored with `medasr eval`'s normaliser.
+
+**Correctness vs v1 and the reference implementation**
+
+| Check | Result |
+|---|---|
+| Log-mel frontend vs `transformers.LasrFeatureExtractor` | bit-exact (max diff 0.0), incl. batched padding masks |
+| Tokenizer decode vs `LasrTokenizer` (3,000 random CTC paths) | 0 mismatches |
+| Architecture vs `transformers.LasrForCTC` (random tiny config, in CI) | max \|Δlogit\| < 2e-4 |
+| v2 vs v1 transcripts, 70 real clips (≤ 20 s) | 70/70 identical, 99.993% frame argmax agreement |
+| true fp16 (stabilised) vs fp32 | 99.91% frame agreement, 12/12 identical transcripts (bf16: 99.50%, 11/12) |
+
+**Medical terms: 710 Eka clips, 122 min, 2,902 annotated entities**
+
+| Decoder | WER | CER | kwER | Term recall |
+|---|---|---|---|---|
+| greedy (v1 decoding; identical output for clips ≤ 20 s) | 17.3% | 8.9% | 20.1% | 71.4% |
+| beam search, width 8 | 16.9% | 8.6% | 19.4% | 72.0% |
+| beam + **patient list** (50 phrases: the clip's terms + 49 random distractors), weight 5 | **15.0%** | **8.2%** | **15.0%** | **80.6%** |
+| beam + **formulary** (all 1,757 entity phrases), weight 2 | 16.3% | 8.6% | 17.2% | 75.8% |
+| beam + formulary, weight 5 (too strong for a list this size) | 20.1% | 10.3% | 16.2% | 79.0% |
+
+The patient list models an EHR medication or problem list. It always contains the right term, so it is an
+optimistic setting, but 98% of each list is distractors. Use weight ≈ 5 for short, specific lists and 2–3 for
+large formularies. Per recording type (greedy → beam + patient list): dictated sentences 12.0% → 10.1% WER,
+conversations 25.5% → 23.0%, and isolated Indian drug-brand narrations 43.9% → 38.4%. Those brands are outside
+MedASR's training data, which is exactly the gap the model card warns about. All runs above use no LM: the
+gated `lm_6.kenlm` was not available to this evaluation.
+
+**Long-form: Temporal Posterior Fusion vs v1's single pass**
+
+| Inference | Eka sessions (25 × 28–130 s) WER | kwER | LibriSpeech chapters (3 × 2.7 min) WER |
+|---|---|---|---|
+| one full-context pass (v1) | 24.1% | 17.9% | 32.6% |
+| **TPF 20 s / 18 s, Hann (v2 default, the report's setting)** | **22.9%** | **16.9%** | **20.6%** |
+| TPF 20 s / 15 s | 22.6% | 17.0% | 20.0% |
+| TPF 10 s / 8 s | 21.8% | 15.9% | 21.3% |
+
+MedASR is fine-tuned on segments of at most 20 s, and accuracy falls off sharply when one pass sees minutes of
+context. TPF fixes this and keeps memory bounded. Hann averaging and hard per-frame window selection performed
+about the same.
+
+STREAMING_PLACEHOLDER
+
+QUANT_PLACEHOLDER
 
 ## Install
 
@@ -142,9 +190,10 @@ final = stream.finish()                         # second pass over fully fused p
 Every *stride* seconds the most recent *window* of audio is recognised and its posteriors are fused into the
 running estimate. Frames with at least `commit_delay_s` (default 1.5 s) of right context are committed and never
 revised. Newer frames are shown as tentative. Compute per second of audio is about `window / stride` times the
-offline cost, so the presets trade accuracy for compute. The report's recipe pads the start with W seconds of
-digital silence; in our tests that made the model emit spurious `]` tokens at speech onset, so v2 grows the
-first windows instead (`start_padding=True` restores the report's behaviour).
+offline cost, so the presets trade accuracy for compute. As in the report, the stream starts with W seconds of
+padding so every window is full length. That measured better than growing the first windows (15.6% vs 16.3%
+committed WER on 119 Eka clips). Digital zeros made the model emit a spurious `]` at speech onset, so v2 pads
+with a −60 dBFS noise floor instead, which removed it (`--no-start-padding` grows the windows instead).
 
 ### Evaluate
 
@@ -213,7 +262,7 @@ v1 model directories (`weights.npz` + `processor/`) load unchanged.
 
 ```bash
 uv sync --extra cpu            # (Linux) + dev group: pytest, ruff
-uv run pytest -q               # 61 tests; tiny random models, no downloads needed
+uv run pytest -q               # 63 tests; tiny random models, no downloads needed
 MEDASR_TEST_MODEL=ainergiz/medasr-mlx-fp16 uv run pytest -m slow   # real-weight regression
 uv run --extra reference python tools/validate_hf.py              # parity vs PyTorch (gated weights)
 ```

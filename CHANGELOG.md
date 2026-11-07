@@ -17,7 +17,9 @@ still loads.
 - **Streaming** with Temporal Posterior Fusion. It runs the *unmodified*
   full-context model on sliding windows and reports committed and tentative
   text, then makes a final second pass. Presets are `paper` (20 s / 320 ms),
-  `balanced` and `low-power`.
+  `balanced` and `low-power`. The stream start is padded as in the report, but
+  with a -60 dBFS noise floor instead of digital silence, which removes a
+  spurious `]` token at speech onset.
 - **Word timestamps and confidences**, segments, and `txt` / `json` / `srt` /
   `vtt` output.
 - **CTC prefix beam search** in pure Python/NumPy, with blank-frame skipping.
@@ -34,7 +36,7 @@ still loads.
   conversion step and no torch.
 - `medasr convert` with optional quantization: affine int3–8 and MLX's
   `mxfp4` / `mxfp8` / `nvfp4`.
-- A test suite of 61 tests, which runs on Linux CPU. It includes architecture
+- A test suite of 63 tests, which runs on Linux CPU. It includes architecture
   parity with transformers' `LasrForCTC`. GitHub Actions CI.
 
 ### Changed
@@ -58,7 +60,7 @@ still loads.
 
 ### Removed
 - The v1 KV-cache streaming path. MedASR is trained full-context, and that
-  path cost +4% WER at 3 s chunks and +15% at 1.5 s. Streaming now uses the
+  path cost +3.9 WER points at 3 s chunks and +14.5 at 1.5 s. Streaming now uses the
   report's recipe instead.
 - The flat scripts (`transcribe_mlx.py`, `benchmark.py`, `convert.py`,
   `quantize.py`, `validate_mlx.py`, ...). See the migration table in the README.

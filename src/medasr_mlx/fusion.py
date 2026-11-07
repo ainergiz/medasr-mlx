@@ -14,6 +14,12 @@ frames with little left or right context count less.
 * Streaming: a small stride (e.g. 320 ms) and ``W`` seconds of leading zero
   padding, so the first window ends at the start of the audio.
 
+MedASR is fine-tuned on segments of at most 20 s, and a single full-context
+pass over long audio (v1's behaviour) degrades badly. On 2.7-minute
+LibriSpeech readings, WER was 32.6% with one pass versus 20.6% with TPF 20/18.
+On Eka clinical sessions of 28-130 s it was 24.1% versus 22.9%. Hann averaging
+and hard "center" selection performed about the same.
+
 Window starts are kept on the 640-sample (40 ms) encoder-frame grid, so frame
 ``j`` of a window starting at sample ``B`` is exactly global frame ``B / 640 + j``.
 """

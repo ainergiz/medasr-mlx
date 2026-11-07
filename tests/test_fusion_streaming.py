@@ -115,7 +115,7 @@ def test_streaming_is_chunking_invariant_and_matches_offline(tiny_asr, speechlik
     # Recompute the same windows offline and fuse them: must equal the stream's posteriors.
     st = tiny_asr.stream(window_s=4.0, stride_s=0.64, start_padding=start_padding)
     pad = st.pad
-    padded = np.concatenate([np.zeros(pad, np.float32), wave])
+    padded = np.concatenate([st._audio[:pad].copy(), wave])  # same (noise) padding
     acc = PosteriorAccumulator(CFG.vocab_size)
     ends = list(range(st.stride, wave.size + 1, st.stride))
     if ends[-1] != wave.size:
