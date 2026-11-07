@@ -1,33 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
 [project]
 name = "medasr-mlx"
-version = "0.1.0"
-description = "Google MedASR (105M Conformer-CTC) ported to MLX for Apple Silicon"
+dynamic = ["version"]
+description = "Google MedASR medical speech recognition on Apple MLX: long-form, streaming, word timestamps and context biasing"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.10"
+keywords = ["asr", "speech-recognition", "medical", "mlx", "apple-silicon", "ctc", "conformer"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
 dependencies = [
     "mlx>=0.30.0",
-    "numpy",
-    "soundfile",
-    "jiwer>=3.0.5",
-    "pyctcdecode>=0.5.0",
-    "kenlm>=0.3.0",
+    "numpy>=1.24",
+    "huggingface_hub>=0.30.0",
+    "soundfile>=0.12",
+    "soxr>=0.3",
 ]
 
 [project.optional-dependencies]
-convert = [
-    "transformers @ git+https://github.com/huggingface/transformers.git@65dc261512cbdb1ee72b88ae5b222f2605aad8e5",
-    "huggingface_hub>=0.30.0",
-    "torch>=2.6.0",
-    "python-dotenv>=1.0.1",
-]
-dev = [
-    "ruff>=0.9.0",
+# Linux: MLX needs an explicit backend.
+cpu = ["mlx[cpu]>=0.30.0"]
+cuda = ["mlx[cuda]>=0.30.0"]
+# Token-level n-gram LM decoding (lm_6.kenlm). On Python >= 3.13 the PyPI sdist
+# does not build; use: pip install https://github.com/kpu/kenlm/archive/master.zip
+lm = ["kenlm>=0.2.0"]
+# Live microphone streaming (`medasr stream --mic`).
+mic = ["sounddevice>=0.4.6"]
+# Building evaluation sets (tools/prepare_eval_data.py).
+eval = ["pyarrow>=14"]
+# Parity check against the reference PyTorch implementation (tools/validate_hf.py).
+reference = ["torch>=2.6", "transformers>=5.0.0"]
+
+[project.scripts]
+medasr = "medasr_mlx.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ainergiz/medasr-mlx"
+"Model (Google)" = "https://huggingface.co/google/medasr"
+"Technical report" = "https://arxiv.org/abs/2605.16555"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.9.0"]
+
+[tool.hatch.version]
+path = "src/medasr_mlx/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/medasr_mlx"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/medasr_mlx", "tests", "tools", "README.md", "CHANGELOG.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: needs downloaded model weights (set MEDASR_TEST_MODEL or network access)",
 ]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py310"
 line-length = 100
+src = ["src", "tests", "tools"]
 
 [tool.ruff.lint]
 select = [
@@ -43,7 +83,8 @@ select = [
 ignore = [
     "E501",  # line too long (handled by formatter)
     "B905",  # zip without strict=
+    "RUF001", "RUF002", "RUF003",  # ▁ (U+2581) is SentencePiece's word marker
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["model", "decode", "streaming", "audio_utils"]
+known-first-party = ["medasr_mlx"]

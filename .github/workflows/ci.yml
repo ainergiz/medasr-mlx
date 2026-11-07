@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx ruff check src tests tools
+      - run: uvx ruff format --check src tests tools
+
+  test-linux:
+    # MLX's Linux CPU backend; also runs the parity test against the PyTorch reference.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          uv venv
+          uv pip install -e ".[cpu]" pytest scipy
+          uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install "transformers>=5.0.0"
+      - name: Test
+        run: uv run --no-sync pytest -q
+
+  test-macos:
+    # Apple Silicon runner (Metal availability on hosted VMs varies, so non-blocking).
+    runs-on: macos-14
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          uv venv
+          uv pip install -e . pytest
+      - run: uv run --no-sync pytest -q
